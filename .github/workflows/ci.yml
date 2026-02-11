@@ -12,9 +12,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync --all-extras --no-sources
-      - run: uv run ruff check src/ tests/
-      - run: uv run ruff format --check src/ tests/
+      - run: uv sync --all-extras --no-sources -P grafeo
+      - run: uv run --frozen ruff check src/ tests/
+      - run: uv run --frozen ruff format --check src/ tests/
 
   test:
     runs-on: ubuntu-latest
@@ -26,8 +26,8 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: uv sync --all-extras --no-sources
-      - run: uv run pytest -v
+      - run: uv sync --all-extras --no-sources -P grafeo
+      - run: uv run --frozen pytest -v
 
   coverage:
     name: Code Coverage
@@ -35,9 +35,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync --all-extras --no-sources
+      - run: uv sync --all-extras --no-sources -P grafeo
       - name: Generate coverage report
-        run: uv run pytest --cov=grafeo_langchain --cov-report=xml:coverage.xml -m 'not integration'
+        run: uv run --frozen pytest --cov=grafeo_langchain --cov-report=xml:coverage.xml -m 'not integration'
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
