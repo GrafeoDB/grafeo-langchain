@@ -5,14 +5,14 @@
 
 # grafeo-langchain
 
-LangChain graph store and vector store backed by [GrafeoDB](https://github.com/GrafeoDB/grafeo) &mdash; an embedded graph database with native vector search.
+LangChain graph store and vector store backed by [GrafeoDB](https://github.com/GrafeoDB/grafeo): an embedded graph database with native vector search.
 
-No servers, no Docker, no configuration. Just `pip install` and go.
+No servers, no Docker, no configuration. Just `uv add` and go.
 
 ## Install
 
 ```bash
-pip install grafeo-langchain
+uv add grafeo-langchain
 ```
 
 ## Quick Start
@@ -93,21 +93,21 @@ docs = store.mmr_traversal_search("programming history", k=4, depth=2, lambda_mu
 
 ### `GrafeoGraphStore`
 
-- `GrafeoGraphStore(db_path=None)` &mdash; in-memory or persistent graph store
-- `.add_graph_documents(docs, include_source=False)` &mdash; ingest LLM-extracted graph documents
-- `.query(query, params=None)` &mdash; execute GQL/Cypher queries
-- `.get_schema` / `.get_structured_schema` &mdash; inspect the graph schema
-- `.refresh_schema()` &mdash; refresh the cached schema
-- `.client` &mdash; access the underlying `GrafeoDB` instance
+- `GrafeoGraphStore(db_path=None)`: in-memory or persistent graph store
+- `.add_graph_documents(docs, include_source=False)`: ingest LLM-extracted graph documents
+- `.query(query, params=None)`: execute GQL/Cypher queries
+- `.get_schema` / `.get_structured_schema`: inspect the graph schema
+- `.refresh_schema()`: refresh the cached schema
+- `.client`: access the underlying `GrafeoDB` instance
 
 ### `GrafeoGraphVectorStore`
 
-- `GrafeoGraphVectorStore(embedding, db_path=None, embedding_dimensions=1536)` &mdash; vector store with graph links
-- `.add_texts(texts, metadatas=None, ids=None)` &mdash; add documents with embeddings and optional graph links
-- `.similarity_search(query, k=4)` &mdash; standard vector similarity search
-- `.traversal_search(query, k=4, depth=1)` &mdash; vector search + graph traversal
-- `.mmr_traversal_search(query, k=4, depth=2, fetch_k=100, lambda_mult=0.5)` &mdash; MMR-diversified traversal
-- `.from_texts(...)` / `.from_documents(...)` &mdash; factory methods
+- `GrafeoGraphVectorStore(embedding, db_path=None, embedding_dimensions=1536)`: vector store with graph links
+- `.add_texts(texts, metadatas=None, ids=None)`: add documents with embeddings and optional graph links
+- `.similarity_search(query, k=4)`: standard vector similarity search
+- `.traversal_search(query, k=4, depth=1)`: vector search + graph traversal
+- `.mmr_traversal_search(query, k=4, depth=2, fetch_k=100, lambda_mult=0.5)`: MMR-diversified traversal
+- `.from_texts(...)` / `.from_documents(...)`: factory methods
 
 ## Requirements
 
