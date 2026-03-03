@@ -86,9 +86,9 @@ class TestAddGraphDocuments:
 
     def test_node_properties_stored(self, store: GrafeoGraphStore) -> None:
         store.add_graph_documents([SAMPLE_GRAPH_DOC])
-        results = store.query("MATCH (n {node_id: 'alice'}) RETURN n")
-        assert len(results) == 1
-        node = store.client.get_node(results[0]["n"])
+        gids = store.client.find_nodes_by_property("node_id", "alice")
+        assert len(gids) == 1
+        node = store.client.get_node(gids[0])
         props = node.properties()
         assert props["name"] == "Alice"
         assert props["age"] == 30
@@ -110,8 +110,8 @@ class TestUpsertBehavior:
         doc2 = GraphDocument(nodes=[updated_alice], relationships=[], source=SOURCE_DOC)
         store.add_graph_documents([doc2])
 
-        results = store.query("MATCH (n {node_id: 'alice'}) RETURN n")
-        node = store.client.get_node(results[0]["n"])
+        gids = store.client.find_nodes_by_property("node_id", "alice")
+        node = store.client.get_node(gids[0])
         props = node.properties()
         assert props["name"] == "Alice Updated"
         assert props["age"] == 31

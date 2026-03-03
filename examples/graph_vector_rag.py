@@ -1,10 +1,13 @@
-"""GraphVectorStore with traversal — hybrid vector + graph retrieval.
+"""GraphVectorStore with traversal, filtering, and deletion.
 
 Demonstrates:
+- Auto-detected embedding dimensions (no manual config needed)
 - Adding documents with embeddings and graph links
 - Similarity search (pure vector)
 - Traversal search (vector seeds + graph walk)
 - MMR traversal search (diversified + graph walk)
+- Metadata filtering
+- Document deletion
 
 Uses a simple hash-based embedding so no API key is needed.
 
@@ -40,7 +43,7 @@ class DemoEmbeddings(Embeddings):
 # ── Create store and add documents with graph links ────────────────────────────
 
 embeddings = DemoEmbeddings()
-store = GrafeoGraphVectorStore(embedding=embeddings, embedding_dimensions=DIMS)
+store = GrafeoGraphVectorStore(embedding=embeddings)  # dimensions auto-detected
 
 store.add_texts(
     texts=[
@@ -85,4 +88,27 @@ for doc in docs:
     score = doc.metadata.get("score", "n/a")
     print(f"  [score={score}] {doc.page_content[:80]}...")
 
+# ── Filtered search ──────────────────────────────────────────────────────────
+
+print()
+print("=== Filtered Search ===")
+store2 = GrafeoGraphVectorStore(embedding=embeddings)
+store2.add_texts(
+    ["Python is a scripting language", "Rust is a systems language", "Go is compiled"],
+    metadatas=[{"category": "scripting"}, {"category": "systems"}, {"category": "systems"}],
+    ids=["py", "rs", "go"],
+)
+docs = store2.similarity_search("language", k=3, filter={"category": "systems"})
+for doc in docs:
+    print(f"  [{doc.metadata.get('id')}] {doc.page_content}")
+
+# ── Delete ───────────────────────────────────────────────────────────────────
+
+print()
+print("=== Delete ===")
+print(f"  Before delete: {len(store2.similarity_search('language', k=10))} docs")
+store2.delete(["py"])
+print(f"  After deleting 'py': {len(store2.similarity_search('language', k=10))} docs")
+
 store.close()
+store2.close()

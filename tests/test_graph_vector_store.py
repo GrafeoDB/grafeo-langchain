@@ -18,7 +18,7 @@ def embedding() -> FakeEmbeddings:
 
 @pytest.fixture
 def store(embedding: FakeEmbeddings) -> GrafeoGraphVectorStore:
-    return GrafeoGraphVectorStore(embedding, embedding_dimensions=DIMS)
+    return GrafeoGraphVectorStore(embedding)
 
 
 TEXTS = [
@@ -186,7 +186,147 @@ class TestVectorStoreLifecycle:
         store.close()  # should not raise
 
     def test_context_manager(self, embedding: FakeEmbeddings) -> None:
-        with GrafeoGraphVectorStore(embedding, embedding_dimensions=DIMS) as store:
+        with GrafeoGraphVectorStore(embedding) as store:
             store.add_texts(TEXTS)
             docs = store.similarity_search(TEXTS[0], k=1)
             assert docs[0].page_content == TEXTS[0]
+
+
+# ── Auto dimension detection ─────────────────────────────────────────────────
+
+
+class TestAutoDimensionDetection:
+    def test_auto_detects_dimensions(self, embedding: FakeEmbeddings) -> None:
+        """Store works without specifying embedding_dimensions."""
+        store = GrafeoGraphVectorStore(embedding)
+        store.add_texts(TEXTS)
+        docs = store.similarity_search(TEXTS[0], k=1)
+        assert docs[0].page_content == TEXTS[0]
+
+    def test_explicit_dimensions_accepted(self, embedding: FakeEmbeddings) -> None:
+        """Explicit dimensions matching the model are accepted."""
+        store = GrafeoGraphVectorStore(embedding, embedding_dimensions=DIMS)
+        store.add_texts(TEXTS)
+        docs = store.similarity_search(TEXTS[0], k=1)
+        assert len(docs) == 1
+
+    def test_dimension_mismatch_raises(self) -> None:
+        """Mismatched explicit dimensions raise ValueError."""
+        emb = FakeEmbeddings(dims=DIMS)
+        with pytest.raises(ValueError, match="does not match"):
+            GrafeoGraphVectorStore(emb, embedding_dimensions=9999)
+
+
+# ── Filter support ───────────────────────────────────────────────────────────
+
+
+class TestFilterSupport:
+    def test_similarity_search_filter(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(
+            ["doc A", "doc B"],
+            metadatas=[{"category": "alpha"}, {"category": "beta"}],
+            ids=["a", "b"],
+        )
+        docs = store.similarity_search("doc", k=2, filter={"category": "alpha"})
+        assert all(d.metadata.get("category") == "alpha" for d in docs)
+
+    def test_similarity_search_by_vector_filter(self, store: GrafeoGraphVectorStore, embedding: FakeEmbeddings) -> None:
+        store.add_texts(
+            ["doc A", "doc B"],
+            metadatas=[{"category": "alpha"}, {"category": "beta"}],
+            ids=["a", "b"],
+        )
+        vec = embedding.embed_query("doc")
+        docs = store.similarity_search_by_vector(vec, k=2, filter={"category": "alpha"})
+        assert all(d.metadata.get("category") == "alpha" for d in docs)
+
+    @pytest.mark.skipif(not HAS_MMR, reason="grafeo build lacks mmr_search")
+    def test_mmr_traversal_search_filter(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(
+            ["doc A", "doc B"],
+            metadatas=[{"category": "alpha"}, {"category": "beta"}],
+            ids=["a", "b"],
+        )
+        docs = store.mmr_traversal_search("doc", k=2, depth=0, filter={"category": "alpha"})
+        assert all(d.metadata.get("category") == "alpha" for d in docs)
+
+
+# ── Delete ───────────────────────────────────────────────────────────────────
+
+
+class TestDelete:
+    def test_delete_removes_documents(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(["doc to keep", "doc to delete"], ids=["keep", "del"])
+        result = store.delete(["del"])
+        assert result is True
+        docs = store.similarity_search("doc", k=10)
+        doc_ids = {d.metadata.get("id") for d in docs}
+        assert "del" not in doc_ids
+        assert "keep" in doc_ids
+
+    def test_delete_empty_ids(self, store: GrafeoGraphVectorStore) -> None:
+        result = store.delete([])
+        assert result is False
+
+    def test_delete_none_ids(self, store: GrafeoGraphVectorStore) -> None:
+        result = store.delete(None)
+        assert result is False
+
+    def test_delete_nonexistent_id(self, store: GrafeoGraphVectorStore) -> None:
+        result = store.delete(["nonexistent"])
+        assert result is False
+
+
+# ── Graph link ordering ──────────────────────────────────────────────────────
+
+
+class TestGraphLinkOrdering:
+    def test_forward_reference_in_same_batch(self, store: GrafeoGraphVectorStore) -> None:
+        """Source added before target in the same batch: links should still work."""
+        store.add_texts(
+            ["source doc", "target doc"],
+            metadatas=[
+                {"__graph_links__": [{"target_id": "target", "type": "CITES"}]},
+                {},
+            ],
+            ids=["source", "target"],
+        )
+        results = store._db.execute("MATCH ()-[r:CITES]->() RETURN r")
+        assert len(list(results)) == 1
+
+    def test_backward_reference_in_same_batch(self, store: GrafeoGraphVectorStore) -> None:
+        """Target added before source in the same batch: links should work too."""
+        store.add_texts(
+            ["target doc", "source doc"],
+            metadatas=[
+                {},
+                {"__graph_links__": [{"target_id": "target", "type": "REFS"}]},
+            ],
+            ids=["target", "source"],
+        )
+        results = store._db.execute("MATCH ()-[r:REFS]->() RETURN r")
+        assert len(list(results)) == 1
+
+
+# ── Score metadata consistency ───────────────────────────────────────────────
+
+
+class TestScoreMetadata:
+    def test_vector_search_has_source_vector(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(TEXTS)
+        docs = store.similarity_search(TEXTS[0], k=1)
+        assert docs[0].metadata.get("source") == "vector"
+
+    def test_traversal_neighbors_have_score_none(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(["neighbor"], ids=["nb"])
+        store.add_texts(
+            ["seed"],
+            metadatas=[{"__graph_links__": [{"target_id": "nb", "type": "LINKS_TO"}]}],
+            ids=["seed"],
+        )
+        docs = store.traversal_search("seed", k=1, depth=1)
+        traversed = [d for d in docs if d.metadata.get("source") == "graph_traversal"]
+        assert len(traversed) >= 1
+        for d in traversed:
+            assert "score" in d.metadata
+            assert d.metadata["score"] is None

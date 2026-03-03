@@ -13,6 +13,9 @@ No servers, no Docker, no configuration. Just `uv add` and go.
 
 ```bash
 uv add grafeo-langchain
+
+# Optional: langchain-graph-retriever integration
+uv add grafeo-langchain[retriever]
 ```
 
 ## Quick Start
@@ -54,7 +57,7 @@ embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 store = GrafeoGraphVectorStore(
     embedding=embeddings,
     db_path="./doc_graph.db",
-    embedding_dimensions=1536,
+    # embedding_dimensions auto-detected from the model
 )
 
 store.add_texts(
@@ -75,6 +78,34 @@ docs = store.traversal_search("What programming languages exist?", k=4, depth=2)
 
 # MMR-diversified graph traversal
 docs = store.mmr_traversal_search("programming history", k=4, depth=2, lambda_mult=0.7)
+
+# Filtered search (only documents with matching metadata)
+docs = store.similarity_search("languages", k=4, filter={"category": "systems"})
+
+# Delete documents
+store.delete(["python", "abc"])
+```
+
+### Graph Retriever Integration
+
+Use `GrafeoAdapter` with [langchain-graph-retriever](https://github.com/datastax/langchain-graph-retriever)
+for advanced traversal strategies (Eager, BFS, MMR) via metadata edges:
+
+```python
+from grafeo_langchain import GrafeoGraphVectorStore
+from grafeo_langchain.adapter import GrafeoAdapter
+from langchain_graph_retriever import GraphRetriever
+
+store = GrafeoGraphVectorStore(embedding=embeddings)
+store.add_texts(
+    texts=["Python is a language", "Rust is a language"],
+    metadatas=[{"topic": "python"}, {"topic": "rust"}],
+    ids=["py", "rs"],
+)
+
+adapter = GrafeoAdapter(vector_store=store)
+retriever = GraphRetriever(store=adapter, edges=[("topic", "topic")])
+docs = retriever.invoke("programming")
 ```
 
 ## Why Grafeo?
@@ -102,12 +133,21 @@ docs = store.mmr_traversal_search("programming history", k=4, depth=2, lambda_mu
 
 ### `GrafeoGraphVectorStore`
 
-- `GrafeoGraphVectorStore(embedding, db_path=None, embedding_dimensions=1536)`: vector store with graph links
+- `GrafeoGraphVectorStore(embedding, db_path=None, embedding_dimensions=None)`: vector store with graph links (dimensions auto-detected from the model)
 - `.add_texts(texts, metadatas=None, ids=None)`: add documents with embeddings and optional graph links
-- `.similarity_search(query, k=4)`: standard vector similarity search
-- `.traversal_search(query, k=4, depth=1)`: vector search + graph traversal
-- `.mmr_traversal_search(query, k=4, depth=2, fetch_k=100, lambda_mult=0.5)`: MMR-diversified traversal
+- `.similarity_search(query, k=4, filter=None)`: standard vector similarity search
+- `.similarity_search_by_vector(embedding, k=4, filter=None)`: search by pre-computed vector
+- `.traversal_search(query, k=4, depth=1, filter=None)`: vector search + graph traversal
+- `.mmr_traversal_search(query, k=4, depth=2, fetch_k=100, lambda_mult=0.5, filter=None)`: MMR-diversified traversal
+- `.delete(ids)`: remove documents by ID
 - `.from_texts(...)` / `.from_documents(...)`: factory methods
+
+### `GrafeoAdapter`
+
+Requires `uv add grafeo-langchain[retriever]`.
+
+- `GrafeoAdapter(vector_store)`: adapter for `langchain-graph-retriever`
+- Works with `GraphRetriever(store=adapter, edges=[...])` for Eager/BFS strategies
 
 ## Requirements
 
