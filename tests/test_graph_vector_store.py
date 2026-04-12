@@ -18,7 +18,7 @@ def embedding() -> FakeEmbeddings:
 
 @pytest.fixture
 def store(embedding: FakeEmbeddings) -> GrafeoGraphVectorStore:
-    return GrafeoGraphVectorStore(embedding, embedding_dimensions=DIMS)
+    return GrafeoGraphVectorStore(embedding)
 
 
 TEXTS = [
@@ -186,7 +186,251 @@ class TestVectorStoreLifecycle:
         store.close()  # should not raise
 
     def test_context_manager(self, embedding: FakeEmbeddings) -> None:
-        with GrafeoGraphVectorStore(embedding, embedding_dimensions=DIMS) as store:
+        with GrafeoGraphVectorStore(embedding) as store:
             store.add_texts(TEXTS)
             docs = store.similarity_search(TEXTS[0], k=1)
             assert docs[0].page_content == TEXTS[0]
+
+
+# ── Auto dimension detection ─────────────────────────────────────────────────
+
+
+class TestAutoDimensionDetection:
+    def test_auto_detects_dimensions(self, embedding: FakeEmbeddings) -> None:
+        """Store works without specifying embedding_dimensions."""
+        store = GrafeoGraphVectorStore(embedding)
+        store.add_texts(TEXTS)
+        docs = store.similarity_search(TEXTS[0], k=1)
+        assert docs[0].page_content == TEXTS[0]
+
+    def test_explicit_dimensions_accepted(self, embedding: FakeEmbeddings) -> None:
+        """Explicit dimensions matching the model are accepted."""
+        store = GrafeoGraphVectorStore(embedding, embedding_dimensions=DIMS)
+        store.add_texts(TEXTS)
+        docs = store.similarity_search(TEXTS[0], k=1)
+        assert len(docs) == 1
+
+    def test_dimension_mismatch_raises(self) -> None:
+        """Mismatched explicit dimensions raise ValueError."""
+        emb = FakeEmbeddings(dims=DIMS)
+        with pytest.raises(ValueError, match="does not match"):
+            GrafeoGraphVectorStore(emb, embedding_dimensions=9999)
+
+
+# ── Filter support ───────────────────────────────────────────────────────────
+
+
+class TestFilterSupport:
+    def test_similarity_search_filter(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(
+            ["doc A", "doc B"],
+            metadatas=[{"category": "alpha"}, {"category": "beta"}],
+            ids=["a", "b"],
+        )
+        docs = store.similarity_search("doc", k=2, filter={"category": "alpha"})
+        assert all(d.metadata.get("category") == "alpha" for d in docs)
+
+    def test_similarity_search_by_vector_filter(self, store: GrafeoGraphVectorStore, embedding: FakeEmbeddings) -> None:
+        store.add_texts(
+            ["doc A", "doc B"],
+            metadatas=[{"category": "alpha"}, {"category": "beta"}],
+            ids=["a", "b"],
+        )
+        vec = embedding.embed_query("doc")
+        docs = store.similarity_search_by_vector(vec, k=2, filter={"category": "alpha"})
+        assert all(d.metadata.get("category") == "alpha" for d in docs)
+
+    @pytest.mark.skipif(not HAS_MMR, reason="grafeo build lacks mmr_search")
+    def test_mmr_traversal_search_filter(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(
+            ["doc A", "doc B"],
+            metadatas=[{"category": "alpha"}, {"category": "beta"}],
+            ids=["a", "b"],
+        )
+        docs = store.mmr_traversal_search("doc", k=2, depth=0, filter={"category": "alpha"})
+        assert all(d.metadata.get("category") == "alpha" for d in docs)
+
+
+# ── Delete ───────────────────────────────────────────────────────────────────
+
+
+class TestDelete:
+    def test_delete_removes_documents(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(["doc to keep", "doc to delete"], ids=["keep", "del"])
+        result = store.delete(["del"])
+        assert result is True
+        docs = store.similarity_search("doc", k=10)
+        doc_ids = {d.metadata.get("id") for d in docs}
+        assert "del" not in doc_ids
+        assert "keep" in doc_ids
+
+    def test_delete_empty_ids(self, store: GrafeoGraphVectorStore) -> None:
+        result = store.delete([])
+        assert result is False
+
+    def test_delete_none_ids(self, store: GrafeoGraphVectorStore) -> None:
+        result = store.delete(None)
+        assert result is False
+
+    def test_delete_nonexistent_id(self, store: GrafeoGraphVectorStore) -> None:
+        result = store.delete(["nonexistent"])
+        assert result is False
+
+
+# ── Graph link ordering ──────────────────────────────────────────────────────
+
+
+class TestGraphLinkOrdering:
+    def test_forward_reference_in_same_batch(self, store: GrafeoGraphVectorStore) -> None:
+        """Source added before target in the same batch: links should still work."""
+        store.add_texts(
+            ["source doc", "target doc"],
+            metadatas=[
+                {"__graph_links__": [{"target_id": "target", "type": "CITES"}]},
+                {},
+            ],
+            ids=["source", "target"],
+        )
+        results = store._db.execute("MATCH ()-[r:CITES]->() RETURN r")
+        assert len(list(results)) == 1
+
+    def test_backward_reference_in_same_batch(self, store: GrafeoGraphVectorStore) -> None:
+        """Target added before source in the same batch: links should work too."""
+        store.add_texts(
+            ["target doc", "source doc"],
+            metadatas=[
+                {},
+                {"__graph_links__": [{"target_id": "target", "type": "REFS"}]},
+            ],
+            ids=["target", "source"],
+        )
+        results = store._db.execute("MATCH ()-[r:REFS]->() RETURN r")
+        assert len(list(results)) == 1
+
+
+# ── Score metadata consistency ───────────────────────────────────────────────
+
+
+class TestScoreMetadata:
+    def test_vector_search_has_source_vector(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(TEXTS)
+        docs = store.similarity_search(TEXTS[0], k=1)
+        assert docs[0].metadata.get("source") == "vector"
+
+    def test_traversal_neighbors_have_score_none(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(["neighbor"], ids=["nb"])
+        store.add_texts(
+            ["seed"],
+            metadatas=[{"__graph_links__": [{"target_id": "nb", "type": "LINKS_TO"}]}],
+            ids=["seed"],
+        )
+        docs = store.traversal_search("seed", k=1, depth=1)
+        traversed = [d for d in docs if d.metadata.get("source") == "graph_traversal"]
+        assert len(traversed) >= 1
+        for d in traversed:
+            assert "score" in d.metadata
+            assert d.metadata["score"] is None
+
+
+# ── Empty/whitespace inputs (T2) ────────────────────────────────────────────
+
+
+class TestEmptyInputs:
+    @pytest.mark.parametrize("text", ["", "   "])
+    def test_empty_or_whitespace_text(self, store: GrafeoGraphVectorStore, text: str) -> None:
+        """Empty or whitespace-only texts should not produce ghost nodes or should raise."""
+        try:
+            ids = store.add_texts([text])
+            # If it succeeds, verify we can search without error
+            docs = store.similarity_search("anything", k=10)
+            # The added text should be retrievable (it was accepted)
+            assert len(ids) == 1
+            assert isinstance(docs, list)
+        except (ValueError, RuntimeError):
+            pass  # raising is also acceptable
+
+
+# ── Circular graph links (T3) ───────────────────────────────────────────────
+
+
+class TestCircularLinks:
+    def test_circular_traversal_terminates(self, store: GrafeoGraphVectorStore) -> None:
+        """A->B->C->A cycle should not cause infinite loop in traversal."""
+        store.add_texts(
+            ["node A", "node B", "node C"],
+            metadatas=[
+                {"__graph_links__": [{"target_id": "b", "type": "LINKS_TO"}]},
+                {"__graph_links__": [{"target_id": "c", "type": "LINKS_TO"}]},
+                {"__graph_links__": [{"target_id": "a", "type": "LINKS_TO"}]},
+            ],
+            ids=["a", "b", "c"],
+        )
+        docs = store.traversal_search("node A", k=4, depth=5)
+        assert isinstance(docs, list)
+        # Should return finite results (no duplicates from looping)
+        doc_ids = [d.metadata.get("id") for d in docs]
+        assert len(doc_ids) == len(set(doc_ids))
+
+
+# ── Self-links (T4) ─────────────────────────────────────────────────────────
+
+
+class TestSelfLinks:
+    def test_self_link_traversal(self, store: GrafeoGraphVectorStore) -> None:
+        """A node linking to itself should not crash traversal."""
+        store.add_texts(
+            ["self-referencing node"],
+            metadatas=[{"__graph_links__": [{"target_id": "self", "type": "SELF_REF"}]}],
+            ids=["self"],
+        )
+        docs = store.traversal_search("self-referencing", k=4, depth=2)
+        assert isinstance(docs, list)
+        assert len(docs) >= 1
+
+
+# ── Embedding dimension mismatch (T5) ───────────────────────────────────────
+
+
+class TestEmbeddingDimensionMismatch:
+    def test_mismatched_dimensions_at_construction(self) -> None:
+        """Explicit dimension mismatch at construction should raise ValueError."""
+        emb = FakeEmbeddings(dims=4)
+        with pytest.raises(ValueError, match="does not match"):
+            GrafeoGraphVectorStore(emb, embedding_dimensions=128)
+
+
+# ── Delete and rebuild (T7) ─────────────────────────────────────────────────
+
+
+class TestDeleteAndRebuild:
+    def test_search_after_partial_delete(self, store: GrafeoGraphVectorStore) -> None:
+        """After deleting half the documents, similarity_search returns only the remaining."""
+        ids = store.add_texts(
+            [f"document {i}" for i in range(10)],
+            ids=[f"d{i}" for i in range(10)],
+        )
+        to_delete = ids[:5]
+        store.delete(to_delete)
+        docs = store.similarity_search("document", k=10)
+        returned_ids = {d.metadata["id"] for d in docs}
+        assert len(returned_ids) == 5
+        for did in to_delete:
+            assert did not in returned_ids
+
+
+# ── Large batch (T8) ────────────────────────────────────────────────────────
+
+
+class TestLargeBatch:
+    def test_add_500_documents(self, store: GrafeoGraphVectorStore) -> None:
+        """Adding 500 documents should not truncate or corrupt."""
+        texts = [f"large batch document number {i}" for i in range(500)]
+        ids = [f"batch-{i}" for i in range(500)]
+        metadatas = [{"batch_index": i} for i in range(500)]
+        returned_ids = store.add_texts(texts, metadatas=metadatas, ids=ids)
+        assert len(returned_ids) == 500
+
+        # Verify search returns correct results
+        docs = store.similarity_search("large batch document number 0", k=10)
+        assert len(docs) == 10
+        assert all(isinstance(d, Document) for d in docs)

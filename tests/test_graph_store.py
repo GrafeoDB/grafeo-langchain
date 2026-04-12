@@ -86,9 +86,9 @@ class TestAddGraphDocuments:
 
     def test_node_properties_stored(self, store: GrafeoGraphStore) -> None:
         store.add_graph_documents([SAMPLE_GRAPH_DOC])
-        results = store.query("MATCH (n {node_id: 'alice'}) RETURN n")
-        assert len(results) == 1
-        node = store.client.get_node(results[0]["n"])
+        gids = store.client.find_nodes_by_property("node_id", "alice")
+        assert len(gids) == 1
+        node = store.client.get_node(gids[0])
         props = node.properties()
         assert props["name"] == "Alice"
         assert props["age"] == 30
@@ -110,8 +110,8 @@ class TestUpsertBehavior:
         doc2 = GraphDocument(nodes=[updated_alice], relationships=[], source=SOURCE_DOC)
         store.add_graph_documents([doc2])
 
-        results = store.query("MATCH (n {node_id: 'alice'}) RETURN n")
-        node = store.client.get_node(results[0]["n"])
+        gids = store.client.find_nodes_by_property("node_id", "alice")
+        node = store.client.get_node(gids[0])
         props = node.properties()
         assert props["name"] == "Alice Updated"
         assert props["age"] == 31
@@ -174,3 +174,56 @@ class TestLabelNormalization:
         store.add_graph_documents([doc])
         results = store.query("MATCH (n:My_Type {node_id: 'y'}) RETURN n")
         assert len(results) == 1
+
+
+# ── Delete behavior (T9) ────────────────────────────────────────────────────
+
+
+class TestGraphStoreDelete:
+    def test_delete_not_supported(self, store: GrafeoGraphStore) -> None:
+        """GraphStore has no delete method; attempting to call it should signal clearly."""
+        assert not hasattr(store, "delete"), (
+            "GrafeoGraphStore does not implement delete; "
+            "if it does, this test should be updated to verify correct behavior"
+        )
+
+
+# ── Schema refresh after mutation (T10) ─────────────────────────────────────
+
+
+class TestSchemaRefreshAfterMutation:
+    def test_schema_grows_with_new_labels(self, store: GrafeoGraphStore) -> None:
+        """Adding documents with new labels should update the schema."""
+        person = Node(id="p1", type="Person", properties={"name": "Alice"})
+        doc1 = GraphDocument(nodes=[person], relationships=[], source=SOURCE_DOC)
+        store.add_graph_documents([doc1])
+        store.refresh_schema()
+        schema1 = store.get_structured_schema
+        assert "Person" in schema1["labels"]
+
+        company = Node(id="c1", type="Company", properties={"name": "Acme"})
+        doc2 = GraphDocument(nodes=[company], relationships=[], source=SOURCE_DOC)
+        store.add_graph_documents([doc2])
+        store.refresh_schema()
+        schema2 = store.get_structured_schema
+        assert "Person" in schema2["labels"]
+        assert "Company" in schema2["labels"]
+
+    def test_schema_grows_with_new_edge_types(self, store: GrafeoGraphStore) -> None:
+        """Adding relationships with new types should update the schema."""
+        alice = Node(id="a", type="Person")
+        bob = Node(id="b", type="Person")
+        rel_knows = Relationship(source=alice, target=bob, type="KNOWS")
+        doc1 = GraphDocument(nodes=[alice, bob], relationships=[rel_knows], source=SOURCE_DOC)
+        store.add_graph_documents([doc1])
+        store.refresh_schema()
+        assert "KNOWS" in store.get_structured_schema["edge_types"]
+
+        acme = Node(id="acme", type="Company")
+        rel_employs = Relationship(source=acme, target=alice, type="EMPLOYS")
+        doc2 = GraphDocument(nodes=[acme], relationships=[rel_employs], source=SOURCE_DOC)
+        store.add_graph_documents([doc2])
+        store.refresh_schema()
+        schema = store.get_structured_schema
+        assert "KNOWS" in schema["edge_types"]
+        assert "EMPLOYS" in schema["edge_types"]

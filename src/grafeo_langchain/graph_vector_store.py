@@ -25,7 +25,8 @@ class GrafeoGraphVectorStore(VectorStore):
     Args:
         embedding: LangChain ``Embeddings`` instance for encoding text.
         db_path: Path to a persistent database file.  ``None`` for in-memory.
-        embedding_dimensions: Dimensionality of the embedding vectors.
+        embedding_dimensions: Dimensionality of the embedding vectors.  Auto-detected
+            from the model if not provided.  When given, validated against the model.
     """
 
     def __init__(
@@ -33,17 +34,32 @@ class GrafeoGraphVectorStore(VectorStore):
         embedding: Embeddings,
         *,
         db_path: str | None = None,
-        embedding_dimensions: int = 1536,
+        embedding_dimensions: int | None = None,
     ) -> None:
         self._embedding = embedding
         self._db = grafeo.GrafeoDB(db_path) if db_path else grafeo.GrafeoDB()
-        self._dims = embedding_dimensions
+
+        # Auto-detect dimensions by probing the embedding model
+        probe = self._embedding.embed_query("dimension probe")
+        detected = len(probe)
+        if embedding_dimensions is not None and embedding_dimensions != detected:
+            msg = (
+                f"embedding_dimensions={embedding_dimensions} does not match "
+                f"the embedding model's actual output ({detected} dimensions)"
+            )
+            raise ValueError(msg)
+        self._dims = detected
 
         if not self._db.has_property_index("doc_id"):
             self._db.create_property_index("doc_id")
 
-        self._index_dirty = False
-        self._node_count = 0
+        # Detect existing Document nodes (e.g. reopened persistent database)
+        existing = len(self._db.get_nodes_by_label("Document"))
+        # TODO: _node_count tracks remaining docs, not total ever created.
+        # After delete+reopen, auto-generated IDs could collide with
+        # previously-deleted IDs. Use user-supplied IDs for persistent stores.
+        self._node_count = existing
+        self._index_dirty = existing > 0
 
     @property
     def embeddings(self) -> Embeddings:
@@ -74,7 +90,10 @@ class GrafeoGraphVectorStore(VectorStore):
 
         vectors = self._embedding.embed_documents(texts_list)
 
+        # Pass 1: create all nodes, collect link definitions
         created_ids: list[str] = []
+        pending_links: list[tuple[int, list[dict[str, Any]]]] = []
+
         for text, meta, doc_id, vec in zip(texts_list, metadatas, ids, vectors, strict=True):
             meta = dict(meta)  # avoid mutating caller's dict
             links = meta.pop(_LINK_KEY, [])
@@ -86,19 +105,23 @@ class GrafeoGraphVectorStore(VectorStore):
 
             node = self._db.create_node(["Document"], props)
             self._node_count += 1
+            created_ids.append(doc_id)
 
+            if links:
+                pending_links.append((node.id, links))
+
+        # Pass 2: create all edges (all nodes from this batch now exist)
+        for source_gid, links in pending_links:
             for link in links:
                 target_id = link.get("target_id", "")
                 edge_type = link.get("type", "LINKS_TO")
                 for target_gid in self._db.find_nodes_by_property("doc_id", target_id):
                     self._db.create_edge(
-                        node.id,
+                        source_gid,
                         target_gid,
                         edge_type,
                         link.get("properties") or None,
                     )
-
-            created_ids.append(doc_id)
 
         self._index_dirty = True
         return created_ids
@@ -107,21 +130,25 @@ class GrafeoGraphVectorStore(VectorStore):
         self,
         embedding: list[float],
         k: int = 4,
+        *,
+        filter: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> list[Document]:
         """Find the *k* most similar documents by vector distance."""
         self._ensure_index()
-        results = self._db.vector_search("Document", "embedding", embedding, k)
+        results = self._db.vector_search("Document", "embedding", embedding, k, filters=filter)
         return self._results_to_documents(results)
 
     def similarity_search(
         self,
         query: str,
         k: int = 4,
+        *,
+        filter: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> list[Document]:
         """Embed *query* and find similar documents."""
-        return self.similarity_search_by_vector(self._embedding.embed_query(query), k=k, **kwargs)
+        return self.similarity_search_by_vector(self._embedding.embed_query(query), k=k, filter=filter, **kwargs)
 
     # ── Graph-enhanced retrieval ──────────────────────────────────────────────
 
@@ -131,13 +158,14 @@ class GrafeoGraphVectorStore(VectorStore):
         *,
         k: int = 4,
         depth: int = 1,
+        filter: dict[str, Any] | None = None,
     ) -> list[Document]:
         """Vector search followed by multi-hop graph traversal.
 
         Finds seed documents by vector similarity, then traverses graph
         links up to *depth* hops to discover connected documents.
         """
-        seeds = self.similarity_search(query, k=k)
+        seeds = self.similarity_search(query, k=k, filter=filter)
         if not seeds or depth < 1:
             return seeds
 
@@ -162,13 +190,20 @@ class GrafeoGraphVectorStore(VectorStore):
         depth: int = 2,
         fetch_k: int = 100,
         lambda_mult: float = 0.5,
+        filter: dict[str, Any] | None = None,
     ) -> list[Document]:
         """MMR-diversified graph traversal using Grafeo's native MMR search."""
         self._ensure_index()
         query_vec = self._embedding.embed_query(query)
 
         mmr_results = self._db.mmr_search(
-            "Document", "embedding", query_vec, k, fetch_k=fetch_k, lambda_mult=lambda_mult
+            "Document",
+            "embedding",
+            query_vec,
+            k,
+            fetch_k=fetch_k,
+            lambda_mult=lambda_mult,
+            filters=filter,
         )
         seeds = self._results_to_documents(mmr_results)
         if not seeds or depth < 1:
@@ -214,6 +249,28 @@ class GrafeoGraphVectorStore(VectorStore):
         metadatas = [doc.metadata for doc in documents]
         return cls.from_texts(texts, embedding, metadatas=metadatas, db_path=db_path, **kwargs)
 
+    # ── Delete ──────────────────────────────────────────────────────────────────
+
+    def delete(self, ids: list[str] | None = None, **kwargs: Any) -> bool:
+        """Delete documents by their doc_id.
+
+        Args:
+            ids: List of document IDs to delete.
+
+        Returns:
+            True if any documents were deleted.
+        """
+        if not ids:
+            return False
+        deleted = False
+        for doc_id in ids:
+            for node_id in self._db.find_nodes_by_property("doc_id", doc_id):
+                self._db.delete_node(node_id)
+                deleted = True
+        if deleted:
+            self._index_dirty = True
+        return deleted
+
     # ── Internals ─────────────────────────────────────────────────────────────
 
     def _ensure_index(self) -> None:
@@ -252,7 +309,9 @@ class GrafeoGraphVectorStore(VectorStore):
             text = props.pop("text", "")
             props.pop("embedding", None)
             props.pop("doc_id", None)
-            result.append(Document(page_content=text, metadata={"id": nid, "source": "graph_traversal", **props}))
+            result.append(
+                Document(page_content=text, metadata={"id": nid, "source": "graph_traversal", "score": None, **props})
+            )
 
     def _results_to_documents(self, results: list[tuple[int, float]]) -> list[Document]:
         docs: list[Document] = []
@@ -264,7 +323,12 @@ class GrafeoGraphVectorStore(VectorStore):
             text = props.pop("text", "")
             props.pop("embedding", None)
             doc_id = props.pop("doc_id", str(node_id))
-            docs.append(Document(page_content=text, metadata={"id": doc_id, "score": 1.0 - distance, **props}))
+            docs.append(
+                Document(
+                    page_content=text,
+                    metadata={"id": doc_id, "source": "vector", "score": 1.0 - distance, **props},
+                )
+            )
         return docs
 
     def close(self) -> None:
