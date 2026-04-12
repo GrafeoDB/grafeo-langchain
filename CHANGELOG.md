@@ -1,31 +1,8 @@
 # Changelog
 
-## 0.2.1
+## 0.2.0 - 2026-04-12
 
-### Added
-
-- Persistence round-trip tests: data and graph links survive close/reopen
-- Filter tests: parametrized across str, int, float, bool; unsupported types handled gracefully
-- Circular graph link test: A->B->C->A traversal at depth 5 returns finite results
-- Self-link test: node linking to itself handled without crash
-- Embedding dimension mismatch test: `ValueError` on wrong dimensions
-- Delete and rebuild test: similarity search correct after partial deletion
-- Large batch test: 500 documents added and verified
-
-### Fixed
-
-- Persistent store reopen: existing Document nodes now detected on constructor, vector index rebuilt before first search
-- `langchain-graph-retriever` optional floor bumped from `>=0.3` to `>=0.8` to match dev pin
-
-### Changed
-
-- README: added Persistence section with `db_path` usage and reopen example
-- README: documented exact-match filter semantics and supported types
-- README: added `[retriever]` extra note in quickstart
-- README: added `__graph_links__` metadata key format reference table
-- 79 tests passing, 98% coverage
-
-## 0.2.0
+Aligned with grafeo 0.5.37. New features, test coverage and documentation improvements.
 
 ### Added
 
@@ -41,11 +18,29 @@
   `uv add grafeo-langchain[retriever]`).
 - `py.typed` marker for PEP 561 type checking support.
 - `__version__` attribute on the package.
+- Persistence round-trip tests: data and graph links survive close/reopen
+- Filter tests: parametrized across str, int, float, bool; unsupported types handled gracefully
+- Circular graph link test: A->B->C->A traversal at depth 5 returns finite results
+- Self-link test: node linking to itself handled without crash
+- Embedding dimension mismatch test: `ValueError` on wrong dimensions
+- Delete and rebuild test: similarity search correct after partial deletion
+- Large batch test: 500 documents added and verified
 
 ### Fixed
 
 - Graph link ordering: links to target documents now resolve correctly regardless
   of insertion order within the same `add_texts` batch (two-pass approach).
+- Persistent store reopen: existing Document nodes now detected on constructor, vector index rebuilt before first search
+- `langchain-graph-retriever` optional floor bumped from `>=0.3` to `>=0.8` to match dev pin
+
+### Changed
+
+- Requires grafeo >=0.5 (tested against 0.5.37)
+- README: added Persistence section with `db_path` usage and reopen example
+- README: documented exact-match filter semantics and supported types
+- README: added `[retriever]` extra note in quickstart
+- README: added `__graph_links__` metadata key format reference table
+- 79 tests passing, 98% coverage
 
 ## 0.1.1
 
