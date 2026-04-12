@@ -53,8 +53,13 @@ class GrafeoGraphVectorStore(VectorStore):
         if not self._db.has_property_index("doc_id"):
             self._db.create_property_index("doc_id")
 
-        self._index_dirty = False
-        self._node_count = 0
+        # Detect existing Document nodes (e.g. reopened persistent database)
+        existing = len(self._db.get_nodes_by_label("Document"))
+        # TODO: _node_count tracks remaining docs, not total ever created.
+        # After delete+reopen, auto-generated IDs could collide with
+        # previously-deleted IDs. Use user-supplied IDs for persistent stores.
+        self._node_count = existing
+        self._index_dirty = existing > 0
 
     @property
     def embeddings(self) -> Embeddings:

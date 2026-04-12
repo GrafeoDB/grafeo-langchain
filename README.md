@@ -14,8 +14,8 @@ No servers, no Docker, no configuration. Just `uv add` and go.
 ```bash
 uv add grafeo-langchain
 
-# Optional: langchain-graph-retriever integration
-uv add grafeo-langchain[retriever]
+# Optional: langchain-graph-retriever integration (requires >=0.8)
+uv add "grafeo-langchain[retriever]"
 ```
 
 ## Quick Start
@@ -86,7 +86,33 @@ docs = store.similarity_search("languages", k=4, filter={"category": "systems"})
 store.delete(["python", "abc"])
 ```
 
+### Persistence
+
+All data is stored in a single `.db` file when you pass `db_path`. Close the store, reopen it later, and your documents, embeddings, and graph links are all still there:
+
+```python
+from langchain_openai import OpenAIEmbeddings
+from grafeo_langchain import GrafeoGraphVectorStore
+
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+# Write phase
+store = GrafeoGraphVectorStore(embedding=embeddings, db_path="./my_store.db")
+store.add_texts(["Python is great", "Rust is fast"], ids=["py", "rs"])
+store.close()
+
+# Later: reopen and query
+store = GrafeoGraphVectorStore(embedding=embeddings, db_path="./my_store.db")
+docs = store.similarity_search("programming languages", k=2)
+store.close()
+```
+
+Omit `db_path` (or pass `None`) for a purely in-memory store that is discarded when the process exits.
+
 ### Graph Retriever Integration
+
+> **Note:** The `[retriever]` extra is required for this feature. Install with
+> `uv add "grafeo-langchain[retriever]"` (requires `langchain-graph-retriever>=0.8`).
 
 Use `GrafeoAdapter` with [langchain-graph-retriever](https://github.com/datastax/langchain-graph-retriever)
 for advanced traversal strategies (Eager, BFS, MMR) via metadata edges:
@@ -107,6 +133,46 @@ adapter = GrafeoAdapter(vector_store=store)
 retriever = GraphRetriever(store=adapter, edges=[("topic", "topic")])
 docs = retriever.invoke("programming")
 ```
+
+## Filters
+
+All filter parameters use **exact-match equality**. Pass a dict where each key is a metadata field name and the value is the expected value. Only documents whose metadata matches every key-value pair are returned:
+
+```python
+docs = store.similarity_search("query", k=4, filter={"category": "science", "year": 2024})
+```
+
+Supported value types: `str`, `int`, `float`, `bool`. Compound types (lists, dicts) are not supported as filter values.
+
+## Graph Links Format
+
+Graph links between documents are specified via the `__graph_links__` metadata key. Each link is a dict with the following fields:
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `target_id` | `str` | Yes | The `id` of the target document |
+| `type` | `str` | No | Edge label (defaults to `LINKS_TO`) |
+| `properties` | `dict` | No | Additional properties stored on the edge |
+
+Example:
+
+```python
+store.add_texts(
+    texts=["Source document", "Target document"],
+    metadatas=[
+        {
+            "__graph_links__": [
+                {"target_id": "target", "type": "CITES"},
+                {"target_id": "other", "type": "RELATES_TO", "properties": {"weight": 0.9}},
+            ]
+        },
+        {},
+    ],
+    ids=["source", "target"],
+)
+```
+
+The `__graph_links__` key is consumed during ingestion and is not stored as document metadata.
 
 ## Why Grafeo?
 

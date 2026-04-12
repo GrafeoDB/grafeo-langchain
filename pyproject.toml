@@ -1,6 +1,6 @@
 [project]
 name = "grafeo-langchain"
-version = "0.2.0"
+version = "0.2.1"
 description = "LangChain graph store and vector store backed by GrafeoDB embedded graph database"
 readme = "README.md"
 license = "Apache-2.0"
@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-retriever = ["langchain-graph-retriever>=0.3"]
+retriever = ["langchain-graph-retriever>=0.8"]
 
 [project.urls]
 Homepage = "https://github.com/GrafeoDB/grafeo-langchain"
