@@ -1,4 +1,4 @@
-"""Basic GrafeoGraphStore usage — knowledge graph from structured data.
+"""Basic GrafeoGraphStore usage: knowledge graph from structured data.
 
 Demonstrates:
 - Creating a graph store (in-memory)

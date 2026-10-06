@@ -15,7 +15,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "grafeo>=0.5",
+    "grafeo>=0.5.44,<0.7",
     "langchain-core>=1.2",
 ]
 
@@ -65,8 +65,8 @@ exclude_lines = [
 ]
 
 # ── UV ────────────────────────────────────────────────────────────────────────
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=9",
     "pytest-cov>=7",
     "ruff>=0.15",

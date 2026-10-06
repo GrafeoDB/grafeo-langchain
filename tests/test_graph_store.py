@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
+
 import pytest
+from langchain_core.documents import Document
 
 from grafeo_langchain import GrafeoGraphStore, GraphDocument, Node, Relationship
 
 from .conftest import (
     ALICE,
+    ALICE_KNOWS_BOB,
+    BOB,
     SAMPLE_GRAPH_DOC,
     SOURCE_DOC,
 )
@@ -227,3 +233,136 @@ class TestSchemaRefreshAfterMutation:
         schema = store.get_structured_schema
         assert "KNOWS" in schema["edge_types"]
         assert "EMPLOYS" in schema["edge_types"]
+
+
+# ── Idempotent re-ingestion ─────────────────────────────────────────────────
+
+
+def _count(store: GrafeoGraphStore, pattern: str) -> int:
+    return len(store.query(f"MATCH {pattern} RETURN 1 AS one"))
+
+
+class TestIdempotentIngestion:
+    def test_relationships_not_duplicated(self, store: GrafeoGraphStore) -> None:
+        store.add_graph_documents([SAMPLE_GRAPH_DOC])
+        store.add_graph_documents([SAMPLE_GRAPH_DOC])
+        assert _count(store, "()-[:WORKS_AT]->()") == 2
+        assert _count(store, "()-[:KNOWS]->()") == 1
+
+    def test_mentioned_in_not_duplicated(self, store: GrafeoGraphStore) -> None:
+        store.add_graph_documents([SAMPLE_GRAPH_DOC], include_source=True)
+        store.add_graph_documents([SAMPLE_GRAPH_DOC], include_source=True)
+        assert _count(store, "(:SourceDocument)") == 1
+        assert _count(store, "()-[:MENTIONED_IN]->()") == 3
+
+    def test_same_relationship_twice_in_one_document(self, store: GrafeoGraphStore) -> None:
+        doc = GraphDocument(nodes=[ALICE], relationships=[ALICE_KNOWS_BOB, ALICE_KNOWS_BOB], source=SOURCE_DOC)
+        store.add_graph_documents([doc])
+        assert _count(store, "()-[:KNOWS]->()") == 1
+
+    def test_relationship_properties_updated(self, store: GrafeoGraphStore) -> None:
+        first = Relationship(source=ALICE, target=BOB, type="KNOWS", properties={"since": 2020})
+        second = Relationship(source=ALICE, target=BOB, type="KNOWS", properties={"since": 2024})
+        store.add_graph_documents([GraphDocument(nodes=[], relationships=[first], source=SOURCE_DOC)])
+        store.add_graph_documents([GraphDocument(nodes=[], relationships=[second], source=SOURCE_DOC)])
+        rows = store.query("MATCH ()-[r:KNOWS]->() RETURN r.since AS since")
+        assert rows == [{"since": 2024}]
+
+    def test_other_types_and_directions_are_separate_edges(self, store: GrafeoGraphStore) -> None:
+        rels = [
+            Relationship(source=ALICE, target=BOB, type="KNOWS"),
+            Relationship(source=ALICE, target=BOB, type="MANAGES"),
+            Relationship(source=BOB, target=ALICE, type="KNOWS"),
+        ]
+        store.add_graph_documents([GraphDocument(nodes=[ALICE, BOB], relationships=rels, source=SOURCE_DOC)])
+        store.add_graph_documents([GraphDocument(nodes=[ALICE, BOB], relationships=rels, source=SOURCE_DOC)])
+        assert _count(store, "()-[]->()") == 3
+
+
+# ── Source document identity ────────────────────────────────────────────────
+
+
+class TestSourceDocumentId:
+    def _source_ids(self, store: GrafeoGraphStore) -> list[str]:
+        return sorted(row["id"] for row in store.query("MATCH (s:SourceDocument) RETURN s.node_id AS id"))
+
+    def test_metadata_id_used(self, store: GrafeoGraphStore) -> None:
+        store.add_graph_documents([SAMPLE_GRAPH_DOC], include_source=True)
+        assert self._source_ids(store) == ["source_doc1"]
+
+    def test_document_id_used_without_metadata_id(self, store: GrafeoGraphStore) -> None:
+        doc = GraphDocument(nodes=[ALICE], relationships=[], source=Document(page_content="text", id="lc-id"))
+        store.add_graph_documents([doc], include_source=True)
+        assert self._source_ids(store) == ["source_lc-id"]
+
+    def test_hash_of_full_text_without_ids(self, store: GrafeoGraphStore) -> None:
+        """The fallback id is stable across processes (Python's hash() is not)."""
+        text = "Alice met Bob."
+        doc = GraphDocument(nodes=[ALICE], relationships=[], source=Document(page_content=text))
+        store.add_graph_documents([doc], include_source=True)
+        expected = hashlib.md5(text.encode("utf-8"), usedforsecurity=False).hexdigest()
+        assert self._source_ids(store) == [f"source_{expected}"]
+
+    def test_documents_sharing_a_prefix_stay_apart(self, store: GrafeoGraphStore) -> None:
+        prefix = "x" * 300
+        for suffix, node in (("one", ALICE), ("two", BOB)):
+            doc = GraphDocument(nodes=[node], relationships=[], source=Document(page_content=prefix + suffix))
+            store.add_graph_documents([doc], include_source=True)
+        assert len(self._source_ids(store)) == 2
+        rows = store.query("MATCH (e)-[:MENTIONED_IN]->(s:SourceDocument) RETURN e.node_id AS e, s.node_id AS s")
+        assert len({row["s"] for row in rows}) == 2
+
+
+# ── Schema reporting ────────────────────────────────────────────────────────
+
+
+class TestSchemaCache:
+    def test_query_write_invalidates_schema(self, store: GrafeoGraphStore) -> None:
+        assert store.get_schema == "Empty graph"
+        store.query("CREATE (:Fresh {node_id: 'f'})")
+        assert "Fresh" in store.get_structured_schema["labels"]
+
+    def test_query_read_keeps_schema_cache(self, store: GrafeoGraphStore) -> None:
+        store.add_graph_documents([SAMPLE_GRAPH_DOC])
+        cached = store.get_structured_schema
+        store.query("MATCH (n:Person) RETURN n.name")
+        assert store._schema is cached
+
+    def test_query_delete_invalidates_schema(self, store: GrafeoGraphStore) -> None:
+        store.add_graph_documents([SAMPLE_GRAPH_DOC])
+        assert "Company" in store.get_structured_schema["labels"]
+        store.query("MATCH (n:Company) DETACH DELETE n")
+        schema = store.get_structured_schema
+        assert "Company" not in schema["labels"]
+        assert "WORKS_AT" not in schema["edge_types"]
+
+    def test_schema_is_sorted_and_stable(self, store: GrafeoGraphStore) -> None:
+        store.add_graph_documents([SAMPLE_GRAPH_DOC], include_source=True)
+        schema = store.get_structured_schema
+        for key in ("labels", "edge_types", "property_keys"):
+            assert schema[key] == sorted(schema[key])
+        text = store.get_schema
+        for _ in range(5):
+            store.refresh_schema()
+            assert store.get_schema == text
+
+
+# ── Persistence ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("suffix", [".grafeo", ".db"], ids=["single-file", "wal-directory"])
+class TestGraphStorePersistence:
+    def test_reopen_and_reingest(self, tmp_path: Path, suffix: str) -> None:
+        db_path = str(tmp_path / f"kg{suffix}")
+        with GrafeoGraphStore(db_path=db_path) as store:
+            store.add_graph_documents([SAMPLE_GRAPH_DOC], include_source=True)
+
+        with GrafeoGraphStore(db_path=db_path) as store:
+            assert store.client.has_property_index("node_id")
+            schema = store.get_structured_schema
+            assert {"Person", "Company", "SourceDocument"} <= set(schema["labels"])
+            store.add_graph_documents([SAMPLE_GRAPH_DOC], include_source=True)
+            assert _count(store, "(:Person)") == 2
+            assert _count(store, "(:SourceDocument)") == 1
+            assert _count(store, "()-[:WORKS_AT]->()") == 2
+            assert _count(store, "()-[:MENTIONED_IN]->()") == 3

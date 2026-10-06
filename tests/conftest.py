@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterator
+from typing import Any
 
+import grafeo
+import pytest
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 
@@ -25,6 +29,21 @@ class FakeEmbeddings(Embeddings):
     def _embed(self, text: str) -> list[float]:
         digest = hashlib.sha256(text.encode()).digest()
         return [b / 255.0 for b in digest[: self.dims]]
+
+
+@pytest.fixture
+def shuffled_rows(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Make every GrafeoDB opened by the stores return unordered rows in random order.
+
+    Catches code that relies on a row order the query does not ask for.
+    """
+    original = grafeo.GrafeoDB
+
+    def open_shuffled(*args: Any, **kwargs: Any) -> grafeo.GrafeoDB:
+        return original(*args, shuffle_unordered=True, **kwargs)
+
+    monkeypatch.setattr(grafeo, "GrafeoDB", open_shuffled)
+    yield
 
 
 # ── Shared test data ──────────────────────────────────────────────────────────

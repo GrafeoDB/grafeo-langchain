@@ -2,11 +2,10 @@
 
 These tests require an OpenAI API key and are skipped by default.
 Run with:
-    uv run pytest -m integration -v
+    uv run --with langchain-openai pytest -m integration -v
 
 Requires:
     OPENAI_API_KEY environment variable
-    pip install langchain-openai
 """
 
 from __future__ import annotations

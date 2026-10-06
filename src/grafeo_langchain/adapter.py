@@ -9,6 +9,7 @@ from langchain_core.documents import Document
 from langchain_graph_retriever._conversion import METADATA_EMBEDDING_KEY
 from langchain_graph_retriever.adapters.langchain import LangchainAdapter
 
+from grafeo_langchain._utils import matches_filter
 from grafeo_langchain.graph_vector_store import GrafeoGraphVectorStore
 
 
@@ -42,6 +43,7 @@ class GrafeoAdapter(LangchainAdapter[GrafeoGraphVectorStore]):
         **kwargs: Any,
     ) -> list[Document]:
         store = self.vector_store
+        store._check_dimensions(embedding)
         store._ensure_index()
         results = store._db.vector_search(
             "Document",
@@ -67,13 +69,12 @@ class GrafeoAdapter(LangchainAdapter[GrafeoGraphVectorStore]):
                 if node is None:
                     continue
                 props = node.properties()
+                if not matches_filter(props, filter):
+                    continue
+
                 text = props.pop("text", "")
                 embedding = props.pop("embedding", None)
                 props.pop("doc_id", None)
-
-                if filter and not self._matches_filter(props, filter):
-                    continue
-
                 meta: dict[str, Any] = {
                     METADATA_EMBEDDING_KEY: embedding,
                     "id": doc_id,
@@ -113,7 +114,3 @@ class GrafeoAdapter(LangchainAdapter[GrafeoGraphVectorStore]):
 
             docs.append(Document(id=doc_id, page_content=text, metadata=meta))
         return docs
-
-    @staticmethod
-    def _matches_filter(props: dict[str, Any], filter: dict[str, Any]) -> bool:
-        return all(props.get(k) == v for k, v in filter.items())

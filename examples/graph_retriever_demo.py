@@ -61,6 +61,7 @@ store.add_texts(
 
 # ── Create adapter and retriever ─────────────────────────────────────────────
 
+from graph_retriever.strategies import Eager  # noqa: E402
 from langchain_graph_retriever import GraphRetriever  # noqa: E402
 
 adapter = GrafeoAdapter(vector_store=store)
@@ -68,8 +69,7 @@ adapter = GrafeoAdapter(vector_store=store)
 retriever = GraphRetriever(
     store=adapter,
     edges=[("topic", "topic")],
-    k=5,
-    start_k=2,
+    strategy=Eager(select_k=5, start_k=2),
 )
 
 # ── Invoke the retriever ─────────────────────────────────────────────────────

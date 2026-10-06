@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import contextlib
+import operator
 from collections.abc import Iterable
 from typing import Any
 
@@ -11,7 +11,20 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
 
+from grafeo_langchain._utils import matches_filter, merge_edge
+
 _LINK_KEY = "__graph_links__"
+_LABEL = "Document"
+_EMBEDDING = "embedding"
+# Properties the store writes itself: metadata cannot overwrite them.
+_RESERVED_KEYS = frozenset({"doc_id", "text", _EMBEDDING})
+
+# One row per reachable document at its shortest distance, closest first.  The
+# depth is part of the query text: variable-length bounds cannot be parameters.
+_TRAVERSAL_QUERY = (
+    "MATCH p = (src:Document)-[*1..{depth}]->(nb:Document) WHERE id(src) = $src "
+    "RETURN id(nb) AS nid, min(length(p)) AS hops ORDER BY hops, nid"
+)
 
 
 class GrafeoGraphVectorStore(VectorStore):
@@ -24,7 +37,9 @@ class GrafeoGraphVectorStore(VectorStore):
 
     Args:
         embedding: LangChain ``Embeddings`` instance for encoding text.
-        db_path: Path to a persistent database file.  ``None`` for in-memory.
+        db_path: Path to a persistent database.  ``None`` for in-memory.  A path
+            ending in ``.grafeo`` is a single-file database; any other path is a
+            WAL-directory database.
         embedding_dimensions: Dimensionality of the embedding vectors.  Auto-detected
             from the model if not provided.  When given, validated against the model.
     """
@@ -37,7 +52,6 @@ class GrafeoGraphVectorStore(VectorStore):
         embedding_dimensions: int | None = None,
     ) -> None:
         self._embedding = embedding
-        self._db = grafeo.GrafeoDB(db_path) if db_path else grafeo.GrafeoDB()
 
         # Auto-detect dimensions by probing the embedding model
         probe = self._embedding.embed_query("dimension probe")
@@ -50,16 +64,25 @@ class GrafeoGraphVectorStore(VectorStore):
             raise ValueError(msg)
         self._dims = detected
 
+        self._db = grafeo.GrafeoDB(db_path) if db_path else grafeo.GrafeoDB()
+        try:
+            self._open()
+        except BaseException:
+            self._db.close()  # release the database file before raising
+            raise
+
+    def _open(self) -> None:
         if not self._db.has_property_index("doc_id"):
             self._db.create_property_index("doc_id")
 
-        # Detect existing Document nodes (e.g. reopened persistent database)
-        existing = len(self._db.get_nodes_by_label("Document"))
-        # TODO: _node_count tracks remaining docs, not total ever created.
-        # After delete+reopen, auto-generated IDs could collide with
-        # previously-deleted IDs. Use user-supplied IDs for persistent stores.
-        self._node_count = existing
-        self._index_dirty = existing > 0
+        self._check_stored_dimensions()
+        # Built once, from the documents already stored (a reopened database), or
+        # empty.  Grafeo keeps it in sync with later writes; see _ensure_index.
+        self._db.create_vector_index(_LABEL, _EMBEDDING, dimensions=self._dims, metric="cosine")
+        self._index_stale = False
+
+        # Counter for generated ids.  Ids in use are skipped (see _new_id).
+        self._next_auto_id: int = self._db.execute("MATCH (n:Document) RETURN count(n) AS n").scalar() or 0
 
     @property
     def embeddings(self) -> Embeddings:
@@ -83,48 +106,63 @@ class GrafeoGraphVectorStore(VectorStore):
                     {"target_id": "other_doc", "type": "RELATES_TO"},
                 ],
             }]
+
+        A text whose id is already stored replaces that document: its text,
+        embedding and metadata are overwritten, its links are kept, and new
+        links are added once.  Texts without an id (``ids`` not given, or a
+        ``None`` entry) get a generated id that no stored document uses.
         """
         texts_list = list(texts)
-        metadatas = metadatas or [{} for _ in texts_list]
-        ids = ids or [str(self._node_count + i) for i in range(len(texts_list))]
+        metadatas_list = list(metadatas) if metadatas is not None else [{} for _ in texts_list]
+        given_ids: list[str | None] = list(ids) if ids is not None else [None] * len(texts_list)
+        if not len(texts_list) == len(metadatas_list) == len(given_ids):
+            msg = (
+                f"got {len(texts_list)} texts, {len(metadatas_list)} metadatas and {len(given_ids)} ids: "
+                "the lengths must match"
+            )
+            raise ValueError(msg)
+        if not texts_list:
+            return []
 
         vectors = self._embedding.embed_documents(texts_list)
+        for vector in vectors:
+            self._check_dimensions(vector)
+        doc_ids = self._assign_ids(given_ids)
 
-        # Pass 1: create all nodes, collect link definitions
-        created_ids: list[str] = []
-        pending_links: list[tuple[int, list[dict[str, Any]]]] = []
-
-        for text, meta, doc_id, vec in zip(texts_list, metadatas, ids, vectors, strict=True):
+        rows: dict[str, dict[str, Any]] = {}  # by doc_id: a repeated id keeps its last row
+        pending_links: list[tuple[str, list[dict[str, Any]]]] = []
+        for text, meta, doc_id, vector in zip(texts_list, metadatas_list, doc_ids, vectors, strict=True):
             meta = dict(meta)  # avoid mutating caller's dict
             links = meta.pop(_LINK_KEY, [])
-
-            props: dict[str, Any] = {"doc_id": doc_id, "text": text, "embedding": vec}
-            for k, v in meta.items():
-                if isinstance(v, str | int | float | bool):
-                    props[k] = v
-
-            node = self._db.create_node(["Document"], props)
-            self._node_count += 1
-            created_ids.append(doc_id)
-
+            row: dict[str, Any] = {
+                k: v for k, v in meta.items() if k not in _RESERVED_KEYS and isinstance(v, str | int | float | bool)
+            }
+            row.update({"doc_id": doc_id, "text": text, _EMBEDDING: vector})
+            rows[doc_id] = row
             if links:
-                pending_links.append((node.id, links))
+                pending_links.append((doc_id, links))
 
-        # Pass 2: create all edges (all nodes from this batch now exist)
-        for source_gid, links in pending_links:
-            for link in links:
-                target_id = link.get("target_id", "")
-                edge_type = link.get("type", "LINKS_TO")
-                for target_gid in self._db.find_nodes_by_property("doc_id", target_id):
-                    self._db.create_edge(
-                        source_gid,
-                        target_gid,
-                        edge_type,
-                        link.get("properties") or None,
-                    )
+        stale = self._stale_properties(rows)
+        # One statement for the batch: every row is written or none is.  A stored
+        # doc_id is updated in place, so its node keeps its edges.  Merge, not
+        # replace: replace=True removes and re-adds the embedding, and removing a
+        # vector damages Grafeo's HNSW graph (see _ensure_index).
+        self._db.upsert_nodes([_LABEL], list(rows.values()), key="doc_id", replace=False)
+        for gid, keys in stale:
+            for key in keys:
+                self._db.remove_node_property(gid, key)
 
-        self._index_dirty = True
-        return created_ids
+        # Links are created once every node of the batch exists, so they may
+        # point forward within the batch.  Links to unknown ids are skipped.
+        for doc_id, links in pending_links:
+            for source_gid in self._db.find_nodes_by_property("doc_id", doc_id):
+                for link in links:
+                    target_id = link.get("target_id", "")
+                    edge_type = link.get("type", "LINKS_TO")
+                    for target_gid in self._db.find_nodes_by_property("doc_id", target_id):
+                        merge_edge(self._db, source_gid, target_gid, edge_type, link.get("properties"))
+
+        return doc_ids
 
     def similarity_search_by_vector(
         self,
@@ -135,9 +173,7 @@ class GrafeoGraphVectorStore(VectorStore):
         **kwargs: Any,
     ) -> list[Document]:
         """Find the *k* most similar documents by vector distance."""
-        self._ensure_index()
-        results = self._db.vector_search("Document", "embedding", embedding, k, filters=filter)
-        return self._results_to_documents(results)
+        return [doc for _, doc in self._vector_hits(embedding, k, filter)]
 
     def similarity_search(
         self,
@@ -163,24 +199,12 @@ class GrafeoGraphVectorStore(VectorStore):
         """Vector search followed by multi-hop graph traversal.
 
         Finds seed documents by vector similarity, then traverses graph
-        links up to *depth* hops to discover connected documents.
+        links up to *depth* hops to discover connected documents, closest
+        first.  *filter* applies to the traversed documents too.  Returns at
+        most ``2 * k`` documents.
         """
-        seeds = self.similarity_search(query, k=k, filter=filter)
-        if not seeds or depth < 1:
-            return seeds
-
-        # _results_to_documents always sets "id" in metadata, so doc_id is never empty
-        # for vector-search seeds.  Seeds without an id are skipped during graph expansion.
-        seen_ids: set[str] = {doc.metadata.get("id", "") for doc in seeds}
-        result: list[Document] = list(seeds)
-
-        for doc in seeds:
-            doc_id = doc.metadata.get("id", "")
-            if not doc_id:
-                continue
-            self._traverse_neighbors(doc_id, depth, seen_ids, result)
-
-        return result[: k * 2]
+        seeds = self._vector_hits(self._embedding.embed_query(query), k, filter)
+        return self._expand(seeds, depth=depth, filter=filter, limit=k * 2)
 
     def mmr_traversal_search(
         self,
@@ -193,32 +217,21 @@ class GrafeoGraphVectorStore(VectorStore):
         filter: dict[str, Any] | None = None,
     ) -> list[Document]:
         """MMR-diversified graph traversal using Grafeo's native MMR search."""
-        self._ensure_index()
         query_vec = self._embedding.embed_query(query)
+        self._check_dimensions(query_vec)
+        self._ensure_index()
 
         mmr_results = self._db.mmr_search(
-            "Document",
-            "embedding",
+            _LABEL,
+            _EMBEDDING,
             query_vec,
             k,
             fetch_k=fetch_k,
             lambda_mult=lambda_mult,
             filters=filter,
         )
-        seeds = self._results_to_documents(mmr_results)
-        if not seeds or depth < 1:
-            return seeds
-
-        seen_ids: set[str] = {doc.metadata.get("id", "") for doc in seeds}
-        result: list[Document] = list(seeds)
-
-        for doc in seeds:
-            doc_id = doc.metadata.get("id", "")
-            if not doc_id:
-                continue
-            self._traverse_neighbors(doc_id, depth, seen_ids, result)
-
-        return result[: k * 2]
+        seeds = self._to_hits(mmr_results)
+        return self._expand(seeds, depth=depth, filter=filter, limit=k * 2)
 
     # ── Factory methods ───────────────────────────────────────────────────────
 
@@ -229,11 +242,12 @@ class GrafeoGraphVectorStore(VectorStore):
         embedding: Embeddings,
         metadatas: list[dict[str, Any]] | None = None,
         *,
+        ids: list[str] | None = None,
         db_path: str | None = None,
         **kwargs: Any,
     ) -> GrafeoGraphVectorStore:
         store = cls(embedding=embedding, db_path=db_path, **kwargs)
-        store.add_texts(texts, metadatas=metadatas)
+        store.add_texts(texts, metadatas=metadatas, ids=ids)
         return store
 
     @classmethod
@@ -247,12 +261,14 @@ class GrafeoGraphVectorStore(VectorStore):
     ) -> GrafeoGraphVectorStore:
         texts = [doc.page_content for doc in documents]
         metadatas = [doc.metadata for doc in documents]
+        if "ids" not in kwargs and any(doc.id for doc in documents):
+            kwargs["ids"] = [doc.id for doc in documents]
         return cls.from_texts(texts, embedding, metadatas=metadatas, db_path=db_path, **kwargs)
 
     # ── Delete ──────────────────────────────────────────────────────────────────
 
     def delete(self, ids: list[str] | None = None, **kwargs: Any) -> bool:
-        """Delete documents by their doc_id.
+        """Delete documents by their doc_id, with their graph links.
 
         Args:
             ids: List of document IDs to delete.
@@ -262,74 +278,146 @@ class GrafeoGraphVectorStore(VectorStore):
         """
         if not ids:
             return False
-        deleted = False
-        for doc_id in ids:
-            for node_id in self._db.find_nodes_by_property("doc_id", doc_id):
-                self._db.delete_node(node_id)
-                deleted = True
+        node_ids = [gid for doc_id in ids for gid in self._db.find_nodes_by_property("doc_id", doc_id)]
+        if not node_ids:
+            return False
+        # DETACH: Grafeo refuses to delete a node that still has edges.
+        result = self._db.execute("MATCH (n) WHERE id(n) IN $ids DETACH DELETE n", {"ids": node_ids})
+        deleted = result.counters["nodes_deleted"] > 0
         if deleted:
-            self._index_dirty = True
+            self._index_stale = True
         return deleted
 
     # ── Internals ─────────────────────────────────────────────────────────────
 
     def _ensure_index(self) -> None:
-        """Rebuild the vector index if documents have been added since the last build.
+        """Rebuild the vector index before a search if documents were deleted.
 
-        Grafeo's HNSW index is currently a static snapshot — nodes added
-        after ``create_vector_index()`` are not automatically indexed.
-        This method rebuilds the index when dirty.
-
-        TODO: Remove once Grafeo supports incremental vector index inserts.
+        Grafeo (0.5.44, unchanged on 0.6.0) removes a deleted vector from its
+        HNSW graph without reconnecting that vector's neighbors, so other
+        documents can drop out of every search.  Writes need no rebuild.
         """
-        if not self._index_dirty or self._node_count == 0:
+        if self._index_stale:
+            self._db.rebuild_vector_index(_LABEL, _EMBEDDING)
+            self._index_stale = False
+
+    def _stale_properties(self, rows: dict[str, dict[str, Any]]) -> list[tuple[int, list[str]]]:
+        """Return the properties of stored documents that the new rows no longer have."""
+        stale: list[tuple[int, list[str]]] = []
+        for doc_id, row in rows.items():
+            for gid in self._db.find_nodes_by_property("doc_id", doc_id):
+                node = self._db.get_node(gid)
+                if node is None:
+                    continue
+                keys = [key for key in node.properties() if key not in row]
+                if keys:
+                    stale.append((gid, keys))
+        return stale
+
+    def _check_dimensions(self, vector: list[float]) -> None:
+        # Grafeo panics (instead of raising) on a search vector of the wrong size.
+        if len(vector) != self._dims:
+            msg = f"got a {len(vector)}-dimensional embedding, but this store holds {self._dims}-dimensional embeddings"
+            raise ValueError(msg)
+
+    def _check_stored_dimensions(self) -> None:
+        sample = self._db.get_nodes_by_label(_LABEL, limit=1)
+        if not sample:
             return
-        with contextlib.suppress(RuntimeError):
-            self._db.create_vector_index("Document", "embedding", dimensions=self._dims, metric="cosine")
-        self._index_dirty = False
-
-    def _traverse_neighbors(
-        self,
-        doc_id: str,
-        depth: int,
-        seen_ids: set[str],
-        result: list[Document],
-    ) -> None:
-        # Variable-length paths require literal depth in GQL
-        neighbors = self._db.execute(
-            f"MATCH (src {{doc_id: $did}})-[*1..{depth}]->(nb:Document) RETURN nb",
-            {"did": doc_id},
-        )
-        for nb_node in neighbors.nodes():
-            props = nb_node.properties()
-            nid = props.get("doc_id", str(nb_node.id))
-            if nid in seen_ids:
-                continue
-            seen_ids.add(nid)
-            text = props.pop("text", "")
-            props.pop("embedding", None)
-            props.pop("doc_id", None)
-            result.append(
-                Document(page_content=text, metadata={"id": nid, "source": "graph_traversal", "score": None, **props})
+        stored = sample[0][1].get(_EMBEDDING)
+        if isinstance(stored, list) and len(stored) != self._dims:
+            msg = (
+                f"the database holds {len(stored)}-dimensional embeddings, "
+                f"but the embedding model produces {self._dims} dimensions"
             )
+            raise ValueError(msg)
 
-    def _results_to_documents(self, results: list[tuple[int, float]]) -> list[Document]:
-        docs: list[Document] = []
+    def _assign_ids(self, given_ids: list[str | None]) -> list[str]:
+        taken = {doc_id for doc_id in given_ids if doc_id is not None}
+        doc_ids: list[str] = []
+        for doc_id in given_ids:
+            if doc_id is None:
+                doc_id = self._new_id(taken)
+                taken.add(doc_id)
+            doc_ids.append(doc_id)
+        return doc_ids
+
+    def _new_id(self, taken: set[str]) -> str:
+        # Sequential ids, skipping ids in use: after deletes and a reopen the
+        # counter can point at a stored document, which add_texts would replace.
+        while True:
+            candidate = str(self._next_auto_id)
+            self._next_auto_id += 1
+            if candidate not in taken and not self._db.find_nodes_by_property("doc_id", candidate):
+                return candidate
+
+    def _vector_hits(
+        self,
+        embedding: list[float],
+        k: int,
+        filter: dict[str, Any] | None,
+    ) -> list[tuple[int, Document]]:
+        self._check_dimensions(embedding)
+        self._ensure_index()
+        return self._to_hits(self._db.vector_search(_LABEL, _EMBEDDING, embedding, k, filters=filter))
+
+    def _to_hits(self, results: list[tuple[int, float]]) -> list[tuple[int, Document]]:
+        """Turn ``(node id, distance)`` search results into ``(node id, Document)`` pairs."""
+        hits: list[tuple[int, Document]] = []
         for node_id, distance in results:
             node = self._db.get_node(node_id)
             if node is None:
                 continue
+            hits.append((node_id, self._to_document(node.properties(), node_id, source="vector", score=1.0 - distance)))
+        return hits
+
+    def _expand(
+        self,
+        seeds: list[tuple[int, Document]],
+        *,
+        depth: int,
+        filter: dict[str, Any] | None,
+        limit: int,
+    ) -> list[Document]:
+        """Append the documents linked from *seeds*, closest first, up to *limit* in total."""
+        result = [doc for _, doc in seeds]
+        depth = operator.index(depth)  # goes into the query text, so it must be an integer
+        if not seeds or depth < 1:
+            return result
+
+        query = _TRAVERSAL_QUERY.format(depth=depth)
+        candidates: list[tuple[int, int]] = []
+        for seed_id, _ in seeds:
+            rows = self._db.execute(query, {"src": seed_id})
+            candidates.extend((row["hops"], row["nid"]) for row in rows)
+        candidates.sort(key=lambda candidate: candidate[0])  # stable: equal distances keep seed order
+
+        seen = {seed_id for seed_id, _ in seeds}
+        for _, node_id in candidates:
+            if len(result) >= limit:
+                break
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            node = self._db.get_node(node_id)
+            if node is None:
+                continue
             props = node.properties()
-            text = props.pop("text", "")
-            props.pop("embedding", None)
-            doc_id = props.pop("doc_id", str(node_id))
-            docs.append(
-                Document(
-                    page_content=text,
-                    metadata={"id": doc_id, "source": "vector", "score": 1.0 - distance, **props},
-                )
-            )
-        return docs
+            if matches_filter(props, filter):
+                result.append(self._to_document(props, node_id, source="graph_traversal", score=None))
+        return result
+
+    @staticmethod
+    def _to_document(props: dict[str, Any], node_id: int, *, source: str, score: float | None) -> Document:
+        props = dict(props)
+        text = props.pop("text", "")
+        props.pop(_EMBEDDING, None)
+        doc_id = props.pop("doc_id", str(node_id))
+        return Document(
+            id=doc_id,
+            page_content=text,
+            metadata={"id": doc_id, "source": source, "score": score, **props},
+        )
 
     def close(self) -> None:
         """Close the database connection."""
