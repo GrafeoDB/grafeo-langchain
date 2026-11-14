@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 import grafeo
+
+# Metadata value types the stores keep; other values (lists, dicts, None, ...) are left out.
+# grafeo 0.6 stores a Decimal exactly and returns one for a GQL number with a point (1.5).
+METADATA_TYPES = (str, int, float, bool, Decimal)
 
 _FIND_EDGES = "MATCH (s)-[r]->(t) WHERE id(s) = $src AND id(t) = $dst AND type(r) = $type RETURN id(r) AS rid"
 
@@ -34,7 +39,8 @@ def merge_edge(
 def matches_filter(properties: dict[str, Any], filter: dict[str, Any] | None) -> bool:
     """Check an exact-match metadata filter the way Grafeo's vector search filters do.
 
-    A value matches only when its type matches too: ``1`` matches neither ``True`` nor ``1.0``.
+    A value matches only when its type matches too: ``1`` matches neither ``True`` nor ``1.0``,
+    and ``Decimal("1.5")`` matches ``Decimal("1.50")`` but not ``1.5``.
     """
     if not filter:
         return True

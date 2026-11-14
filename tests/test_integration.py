@@ -10,6 +10,7 @@ Requires:
 
 from __future__ import annotations
 
+import importlib
 import os
 
 import pytest
@@ -21,7 +22,8 @@ pytestmark = pytest.mark.integration
 HAVE_OPENAI_KEY = bool(os.environ.get("OPENAI_API_KEY"))
 
 try:
-    from langchain_openai import OpenAIEmbeddings  # type: ignore[unresolved-import]
+    # an optional dependency, imported by name so type checkers do not require it
+    OpenAIEmbeddings = importlib.import_module("langchain_openai").OpenAIEmbeddings
 
     HAVE_OPENAI = True
 except ImportError:

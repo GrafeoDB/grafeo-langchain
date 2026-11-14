@@ -8,7 +8,9 @@ and its message names the code in grafeo-langchain that has to follow.
 from __future__ import annotations
 
 import hashlib
+import random
 import re
+from decimal import Decimal
 from pathlib import Path
 
 import grafeo
@@ -25,6 +27,10 @@ def _version_tuple(version: str) -> tuple[int, ...]:
     match = re.match(r"(\d+)\.(\d+)\.(\d+)", version)
     assert match, f"unexpected grafeo version string {version!r}"
     return tuple(int(part) for part in match.groups())
+
+
+def _vectors(count: int, seed: str = "") -> list[list[float]]:
+    return [[b / 255.0 for b in hashlib.sha256(f"{seed}document {i}".encode()).digest()[:DIMS]] for i in range(count)]
 
 
 @pytest.fixture
@@ -51,8 +57,8 @@ def _gid(db: grafeo.GrafeoDB, doc_id: str) -> int:
 
 class TestPackage:
     def test_minimum_version(self) -> None:
-        assert _version_tuple(grafeo.__version__) >= (0, 5, 44), (
-            "grafeo-langchain needs grafeo>=0.5.44 (upsert_nodes, result counters, write validation)"
+        assert (0, 6, 0) <= _version_tuple(grafeo.__version__) < (0, 7, 0), (
+            "grafeo-langchain 0.3 needs grafeo 0.6 (file format, vector deletes, replacing upserts)"
         )
 
     def test_features_include_query_languages_and_vector_index(self) -> None:
@@ -111,10 +117,10 @@ class TestNodes:
 
 
 class TestUpsertNodes:
-    """GrafeoGraphVectorStore.add_texts writes every batch with one merging upsert_nodes call."""
+    """GrafeoGraphVectorStore.add_texts writes every batch with one replacing upsert_nodes call."""
 
     def _upsert(self, db: grafeo.GrafeoDB, rows: list[dict]) -> dict:
-        return db.upsert_nodes(["Document"], rows, key="doc_id", replace=False)
+        return db.upsert_nodes(["Document"], rows, key="doc_id", replace=True)
 
     def test_creates_then_updates_by_key(self, indexed_db: grafeo.GrafeoDB) -> None:
         first = self._upsert(indexed_db, [{"doc_id": "a", "embedding": X}])
@@ -124,16 +130,13 @@ class TestUpsertNodes:
         assert (second["created"], second["updated"]) == (0, 1)
         assert _gid(indexed_db, "a") == gid, "an upsert must update the node in place"
 
-    def test_merge_keeps_other_properties(self, indexed_db: grafeo.GrafeoDB) -> None:
-        # add_texts removes the stale ones itself with remove_node_property
+    def test_replace_drops_other_properties(self, indexed_db: grafeo.GrafeoDB) -> None:
+        # add_texts relies on it to drop the metadata keys a replaced document no longer has
         self._upsert(indexed_db, [{"doc_id": "a", "embedding": X, "old": 1}])
         self._upsert(indexed_db, [{"doc_id": "a", "embedding": X, "new": 2}])
-        gid = _gid(indexed_db, "a")
-        assert indexed_db.get_node(gid).properties()["old"] == 1
-        indexed_db.remove_node_property(gid, "old")
-        props = indexed_db.get_node(gid).properties()
-        assert "old" not in props
-        assert props["new"] == 2
+        node = indexed_db.get_node(_gid(indexed_db, "a"))
+        assert node.properties() == {"doc_id": "a", "embedding": X, "new": 2}
+        assert node.labels == ["Document"]
 
     def test_update_keeps_edges(self, indexed_db: grafeo.GrafeoDB) -> None:
         self._upsert(indexed_db, [{"doc_id": "a", "embedding": X}, {"doc_id": "b", "embedding": Y}])
@@ -143,10 +146,17 @@ class TestUpsertNodes:
         assert indexed_db.edge_count == 2
 
     def test_batch_is_all_or_nothing(self, indexed_db: grafeo.GrafeoDB) -> None:
-        rows = [{"doc_id": "ok", "embedding": X}, {"doc_id": "bad", "embedding": [1.0, 0.0]}]
+        self._upsert(indexed_db, [{"doc_id": "kept", "embedding": X, "old": 1}])
+        rows = [
+            {"doc_id": "ok", "embedding": X},
+            {"doc_id": "kept", "embedding": Y},
+            {"doc_id": "bad", "embedding": [1.0, 0.0]},
+        ]
         with pytest.raises(grafeo.GrafeoError):
             self._upsert(indexed_db, rows)
         assert indexed_db.find_nodes_by_property("doc_id", "ok") == []
+        kept = indexed_db.get_node(_gid(indexed_db, "kept")).properties()
+        assert kept == {"doc_id": "kept", "embedding": X, "old": 1}, "a failed batch must not replace any node"
 
 
 # ── Vector index ──────────────────────────────────────────────────────────────
@@ -170,17 +180,17 @@ class TestVectorIndex:
         assert node_id == _gid(indexed_db, "a")
         assert distance == pytest.approx(0.0, abs=1e-5), "an upserted embedding must replace the indexed one"
 
-    def test_merging_upsert_keeps_other_vectors_reachable(self, indexed_db: grafeo.GrafeoDB) -> None:
-        # Updating a vector in place (SET n += row) must not disturb the other vectors.
-        # add_texts merges instead of replacing: replace=True removes the vector first,
-        # which can leave other vectors unreachable (see the next test).
-        vectors = [[0.81, 0.17, 0.15, 0.87], [0.44, 0.50, 0.26, 0.23], [0.13, 0.66, 0.43, 0.88]]
+    def test_replacing_upserts_keep_other_vectors_reachable(self, indexed_db: grafeo.GrafeoDB) -> None:
+        # add_texts replaces a stored document's embedding (replace=True removes the old
+        # vector first).  grafeo 0.5.44 could leave other vectors unreachable when a
+        # vector was removed (#600, fixed in 0.6.0b1).
+        vectors = _vectors(30, "replace ")
         rows = [{"doc_id": f"d{i}", "embedding": vector} for i, vector in enumerate(vectors)]
-        indexed_db.upsert_nodes(["Document"], rows, key="doc_id", replace=False)
-        update = [{"doc_id": "d1", "embedding": [0.03, 0.96, 0.19, 0.48]}]
-        indexed_db.upsert_nodes(["Document"], update, key="doc_id", replace=False)
-        hits = {node_id for node_id, _ in indexed_db.vector_search("Document", "embedding", X, 10)}
-        assert hits == {_gid(indexed_db, f"d{i}") for i in range(3)}
+        indexed_db.upsert_nodes(["Document"], rows, key="doc_id", replace=True)
+        update = [{"doc_id": f"d{i}", "embedding": vectors[(i + 7) % 30]} for i in range(0, 30, 2)]
+        indexed_db.upsert_nodes(["Document"], update, key="doc_id", replace=True)
+        hits = {node_id for node_id, _ in indexed_db.vector_search("Document", "embedding", X, 30)}
+        assert hits == {_gid(indexed_db, f"d{i}") for i in range(30)}
 
     def test_index_follows_detach_delete(self, indexed_db: grafeo.GrafeoDB) -> None:
         keep = indexed_db.create_node(["Document"], {"doc_id": "keep", "embedding": X})
@@ -188,17 +198,22 @@ class TestVectorIndex:
         indexed_db.execute("MATCH (n) WHERE id(n) IN $ids DETACH DELETE n", {"ids": [gone.id]})
         assert [hit[0] for hit in indexed_db.vector_search("Document", "embedding", Y, 4)] == [keep.id]
 
-    def test_rebuild_restores_every_vector_after_deletes(self, indexed_db: grafeo.GrafeoDB) -> None:
-        # Removing a vector can leave other vectors unreachable in Grafeo's HNSW graph:
-        # with this data, 0.5.44 finds 3 of the 4 remaining vectors before the rebuild.
-        # GrafeoGraphVectorStore._ensure_index rebuilds the index after deletes and
-        # relies on the rebuild finding them all.
-        vectors = [[b / 255.0 for b in hashlib.sha256(f"document {i}".encode()).digest()[:4]] for i in range(5)]
-        nodes = [indexed_db.create_node(["Document"], {"embedding": vector}).id for vector in vectors]
-        indexed_db.execute("MATCH (n) WHERE id(n) IN $ids DETACH DELETE n", {"ids": [nodes[1]]})
-        indexed_db.rebuild_vector_index("Document", "embedding")
-        hits = {node_id for node_id, _ in indexed_db.vector_search("Document", "embedding", X, 10)}
-        assert hits == set(nodes) - {nodes[1]}
+    @pytest.mark.parametrize(("count", "deletes"), [(5, 1), (20, 5), (60, 20)])
+    def test_deletes_keep_every_other_vector_reachable(self, count: int, deletes: int) -> None:
+        # GrafeoGraphVectorStore.delete no longer rebuilds the vector index.  grafeo 0.5.44
+        # dropped the HNSW links through a deleted vector, so other vectors could drop out
+        # of every search (#600): these cases lose vectors in 44 of 120 runs on 0.5.44.
+        for seed in range(40):
+            db = grafeo.GrafeoDB()
+            db.create_vector_index("Document", "embedding", dimensions=DIMS, metric="cosine")
+            nodes = [db.create_node(["Document"], {"embedding": v}).id for v in _vectors(count, f"{seed} ")]
+            gone = random.Random(seed).sample(nodes, deletes)
+            db.execute("MATCH (n) WHERE id(n) IN $ids DETACH DELETE n", {"ids": gone})
+            hits = {node_id for node_id, _ in db.vector_search("Document", "embedding", X, count)}
+            assert hits == set(nodes) - set(gone), (
+                f"seed {seed}: a delete left vectors unreachable; restore the index rebuild after deletes "
+                "in GrafeoGraphVectorStore.delete"
+            )
 
     def test_create_again_rebuilds_without_error(self, indexed_db: grafeo.GrafeoDB) -> None:
         # Every GrafeoGraphVectorStore.__init__ calls create_vector_index, also on a
@@ -282,6 +297,65 @@ class TestFilters:
     def test_mmr_search_returns_at_most_k(self, indexed_db: grafeo.GrafeoDB) -> None:
         hits = indexed_db.mmr_search("Document", "embedding", X, 1, fetch_k=10, lambda_mult=0.5)
         assert len(hits) == 1
+
+
+class TestDecimals:
+    """grafeo 0.6.0: GQL numbers with a point and Python Decimals are exact decimals (#610).
+
+    The stores keep Decimal metadata (_utils.METADATA_TYPES), and _utils.matches_filter
+    compares a Decimal filter value the way vector search filters do.
+    """
+
+    def test_gql_number_with_a_point(self, db: grafeo.GrafeoDB) -> None:
+        row = next(iter(db.execute("RETURN 1.50 AS d, 0.1 + 0.2 AS s, 1.5e0 AS f, 2 AS i")))
+        assert row["f"] == 1.5 and isinstance(row["f"], float), "a number with an exponent stays a float"
+        assert row["i"] == 2 and isinstance(row["i"], int)
+        assert row["d"] == Decimal("1.50") and str(row["d"]) == "1.50"
+        assert row["s"] == Decimal("0.3")
+
+    def test_decimal_property_round_trip(self, db: grafeo.GrafeoDB) -> None:
+        node = db.create_node(["Document"], {"doc_id": "a", "price": Decimal("1.50")})
+        stored = db.get_node(node.id).properties()["price"]
+        assert isinstance(stored, Decimal) and str(stored) == "1.50"
+
+    def test_gql_write_stores_a_decimal(self, db: grafeo.GrafeoDB) -> None:
+        # README: a property set by a GQL query with 9.99 reads back as a Decimal
+        db.execute("INSERT (:Document {doc_id: 'a', price: 9.99})")
+        stored = db.get_node(_gid(db, "a")).properties()["price"]
+        assert type(stored) is Decimal
+        assert stored == Decimal("9.99")
+
+    def test_vector_filter_on_decimals(self, indexed_db: grafeo.GrafeoDB) -> None:
+        dec = indexed_db.create_node(["Document"], {"doc_id": "dec", "embedding": X, "price": Decimal("1.50")})
+        flt = indexed_db.create_node(["Document"], {"doc_id": "flt", "embedding": Y, "price": 1.5})
+
+        def hits(value: object) -> set[int]:
+            return {i for i, _ in indexed_db.vector_search("Document", "embedding", X, 4, filters={"price": value})}
+
+        assert hits("1.5") == set()
+        assert hits(Decimal("1.5")) == {dec.id}, "a Decimal filter matches decimals of equal value, any scale"
+        assert hits(1.5) == {flt.id}, "a float filter does not match a decimal"
+
+
+class TestNullOrdering:
+    """grafeo 0.6: GQL sorts nulls last in both directions (#571); Cypher keeps openCypher's order.
+
+    GrafeoGraphStore.query runs GQL; the README says so.
+    """
+
+    @pytest.fixture
+    def people(self, db: grafeo.GrafeoDB) -> grafeo.GrafeoDB:
+        db.execute("INSERT (:P {n: 'x', age: 3}), (:P {n: 'y'}), (:P {n: 'z', age: 1})")
+        return db
+
+    @pytest.mark.parametrize(("order", "expected"), [("", "zxy"), (" DESC", "xzy")], ids=["asc", "desc"])
+    def test_gql_nulls_last(self, people: grafeo.GrafeoDB, order: str, expected: str) -> None:
+        rows = people.execute(f"MATCH (p:P) RETURN p.n AS n ORDER BY p.age{order}")
+        assert "".join(row["n"] for row in rows) == expected
+
+    def test_cypher_desc_nulls_first(self, people: grafeo.GrafeoDB) -> None:
+        rows = people.execute_cypher("MATCH (p:P) RETURN p.n AS n ORDER BY p.age DESC")
+        assert "".join(row["n"] for row in rows) == "yxz"
 
 
 # ── Edges, deletes and queries ────────────────────────────────────────────────
@@ -392,40 +466,55 @@ class TestSchema:
         assert {entry["name"]: entry["count"] for entry in schema["edge_types"]} == {"KNOWS": 1}
         assert "node_id" in schema["property_keys"]
 
-    def test_deleted_labels_stay_with_count_zero(self, db: grafeo.GrafeoDB) -> None:
-        # GrafeoGraphStore.refresh_schema leaves out entries with a count of 0
-        db.execute("CREATE (:Gone {node_id: 'g'})")
+    def test_deleted_labels_are_left_out(self, db: grafeo.GrafeoDB) -> None:
+        # grafeo 0.6.2 leaves a label or edge type out of schema() once its last node or
+        # edge is deleted, so GrafeoGraphStore.refresh_schema needs no count filter.
+        db.execute("INSERT (:Gone {node_id: 'g'})-[:GONE_EDGE]->(:Keep)")
         db.execute("MATCH (n:Gone) DETACH DELETE n")
-        counts = {entry["name"]: entry.get("count") for entry in db.schema()["labels"]}
-        assert counts.get("Gone", 0) == 0
+        schema = db.schema()
+        labels = {entry["name"]: entry["count"] for entry in schema["labels"]}
+        edge_types = {entry["name"]: entry["count"] for entry in schema["edge_types"]}
+        assert (labels, edge_types) == ({"Keep": 1}, {})
 
 
 # ── Persistence ───────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("suffix", [".grafeo", ".db"], ids=["single-file", "wal-directory"])
 class TestPersistence:
+    @pytest.mark.parametrize("suffix", [".grafeo", ".db"], ids=["grafeo-extension", "other-extension"])
     def test_data_survives_reopen(self, tmp_path: Path, suffix: str) -> None:
-        path = str(tmp_path / f"contract{suffix}")
-        db = grafeo.GrafeoDB(path)
+        # grafeo 0.6: every database is one file, whatever its extension (0.5.x made a
+        # WAL directory for a path without .grafeo), with its WAL beside it while open.
+        path = tmp_path / f"contract{suffix}"
+        db = grafeo.GrafeoDB(str(path))
         a = db.create_node(["Document"], {"doc_id": "a", "embedding": X, "n": 1})
         b = db.create_node(["Document"], {"doc_id": "b", "embedding": Y})
         db.create_edge(a.id, b.id, "LINKS_TO", {"w": 0.5})
+        db.create_property_index("doc_id")
+        db.create_vector_index("Document", "embedding", dimensions=DIMS, metric="cosine")
+        assert Path(f"{path}.wal").is_dir()
         db.close()
+        assert path.is_file()
+        assert sorted(p.name for p in tmp_path.iterdir()) == [path.name], "close() leaves the single file only"
 
-        db = grafeo.GrafeoDB(path)
+        db = grafeo.GrafeoDB(str(path))
         try:
             assert db.node_count == 2
             assert db.edge_count == 1
             props = db.get_nodes_by_label("Document", limit=1)[0][1]
             assert props["embedding"] in (X, Y)
-            # indexes may or may not survive a reopen (WAL directories keep them only
-            # from 0.6.0): the stores recreate them, which must work in both cases
-            if not db.has_property_index("doc_id"):
-                db.create_property_index("doc_id")
+            assert db.has_property_index("doc_id"), "indexes survive a reopen"
+            # every store open calls create_vector_index again, on the surviving index
             db.create_vector_index("Document", "embedding", dimensions=DIMS, metric="cosine")
             node_id, _ = db.vector_search("Document", "embedding", X, 1)[0]
             assert db.get_node(node_id).properties()["doc_id"] == "a"
             assert db.find_nodes_by_property("doc_id", "b") != []
         finally:
             db.close()
+
+    def test_directory_that_is_no_database_is_refused(self, tmp_path: Path) -> None:
+        # 0.5.x created a WAL-directory database in an empty directory; 0.6 refuses it.
+        # The stores pass db_path through, so a directory path raises GrafeoError.
+        with pytest.raises(grafeo.GrafeoError, match="not a database file"):
+            grafeo.GrafeoDB(str(tmp_path))
+        assert list(tmp_path.iterdir()) == [], "a refused open changes nothing"

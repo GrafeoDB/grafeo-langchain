@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -144,6 +145,28 @@ class TestQuery:
         store.add_graph_documents([doc])
         results = store.query("MATCH (e {node_id: 'eve'})-[:FOLLOWS]->(a {node_id: 'alice'}) RETURN e, a")
         assert len(results) == 1
+
+    @pytest.mark.parametrize(("order", "expected"), [("", ["bob", "alice", "eve"]), (" DESC", ["alice", "bob", "eve"])])
+    def test_order_by_puts_missing_values_last(self, store: GrafeoGraphStore, order: str, expected: list) -> None:
+        # grafeo 0.6: GQL sorts nulls last in both directions (0.5 put them first with DESC)
+        eve = Node(id="eve", type="Person", properties={"name": "Eve"})
+        store.add_graph_documents([SAMPLE_GRAPH_DOC, GraphDocument(nodes=[eve], relationships=[], source=SOURCE_DOC)])
+        rows = store.query(f"MATCH (p:Person) RETURN p.node_id AS id ORDER BY p.age{order}")
+        assert [row["id"] for row in rows] == expected
+
+    def test_number_with_a_point_in_results(self, store: GrafeoGraphStore) -> None:
+        # grafeo 0.6.0: a GQL number with a point is an exact decimal, also once stored
+        store.query("INSERT (:Product {node_id: 'p', price: 9.99})")
+        row = store.query("MATCH (p:Product) RETURN p.price AS price, p.price * 3 AS total")[0]
+        assert row == {"price": Decimal("9.99"), "total": Decimal("29.97")}
+
+    def test_decimal_node_properties(self, store: GrafeoGraphStore) -> None:
+        item = Node(id="item", type="Product", properties={"price": Decimal("9.99")})
+        source = Document(page_content="An item.", metadata={"id": "s", "weight": Decimal("0.25")})
+        store.add_graph_documents([GraphDocument(nodes=[item], relationships=[], source=source)], include_source=True)
+        row = store.query("MATCH (p:Product), (s:SourceDocument) RETURN p.price AS price, s.weight AS weight")[0]
+        assert row == {"price": Decimal("9.99"), "weight": Decimal("0.25")}
+        assert isinstance(row["price"], Decimal) and isinstance(row["weight"], Decimal)
 
 
 # ── Lifecycle ──────────────────────────────────────────────────────────────────
@@ -350,12 +373,13 @@ class TestSchemaCache:
 # ── Persistence ─────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("suffix", [".grafeo", ".db"], ids=["single-file", "wal-directory"])
+@pytest.mark.parametrize("suffix", [".grafeo", ".db"], ids=["grafeo-extension", "other-extension"])
 class TestGraphStorePersistence:
     def test_reopen_and_reingest(self, tmp_path: Path, suffix: str) -> None:
         db_path = str(tmp_path / f"kg{suffix}")
         with GrafeoGraphStore(db_path=db_path) as store:
             store.add_graph_documents([SAMPLE_GRAPH_DOC], include_source=True)
+        assert Path(db_path).is_file(), "grafeo 0.6 keeps every database in one file"
 
         with GrafeoGraphStore(db_path=db_path) as store:
             assert store.client.has_property_index("node_id")
