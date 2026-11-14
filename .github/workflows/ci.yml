@@ -10,20 +10,27 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
       - run: uv sync --all-extras --no-sources -P grafeo
       - run: uv run --frozen ruff check src/ tests/
       - run: uv run --frozen ruff format --check src/ tests/
 
   test:
     runs-on: ubuntu-latest
+    # Python 3.15 is allowed to fail: zstandard (langchain-core > langsmith) has no 3.15 wheels yet,
+    # so it is built from source
+    continue-on-error: ${{ matrix.experimental }}
     strategy:
       matrix:
         python-version: ["3.12", "3.13", "3.14"]
+        experimental: [false]
+        include:
+          - python-version: "3.15"
+            experimental: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --all-extras --no-sources -P grafeo
@@ -33,13 +40,13 @@ jobs:
     name: Code Coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
       - run: uv sync --all-extras --no-sources -P grafeo
       - name: Generate coverage report
         run: uv run --frozen pytest --cov=grafeo_langchain --cov-report=xml:coverage.xml -m 'not integration'
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.xml

@@ -19,8 +19,8 @@ jobs:
         python-version: ["3.12", "3.14"]
         grafeo: [pinned, newest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --all-extras --no-sources --upgrade-package grafeo --prerelease allow
