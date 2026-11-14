@@ -1,6 +1,6 @@
 [project]
 name = "grafeo-langchain"
-version = "0.2.0"
+version = "0.3.0"
 description = "LangChain graph store and vector store backed by GrafeoDB embedded graph database"
 readme = "README.md"
 license = "Apache-2.0"
@@ -10,12 +10,16 @@ keywords = ["langchain", "graph-store", "graph-rag", "grafeo", "knowledge-graph"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Database :: Database Engines/Servers",
 ]
 
 dependencies = [
-    "grafeo>=0.5.44,<0.7",
+    "grafeo>=0.6.2,<0.7",
     "langchain-core>=1.2",
 ]
 
