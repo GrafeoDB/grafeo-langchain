@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.0
       - run: uv sync --all-extras --no-sources -P grafeo
       - run: uv run --frozen ruff check src/ tests/
       - run: uv run --frozen ruff format --check src/ tests/
@@ -30,7 +30,7 @@ jobs:
             experimental: true
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --all-extras --no-sources -P grafeo
@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.0
       - run: uv sync --all-extras --no-sources -P grafeo
       - name: Generate coverage report
         run: uv run --frozen pytest --cov=grafeo_langchain --cov-report=xml:coverage.xml -m 'not integration'

@@ -13,6 +13,6 @@ jobs:
     environment: pypi
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.0
       - run: uv build
       - uses: pypa/gh-action-pypi-publish@release/v1
