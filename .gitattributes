@@ -1,0 +1,3 @@
+# Databases written by grafeo 0.5.44 for the migration tests: keep their bytes as written
+tests/fixtures/*.grafeo binary
+tests/fixtures/*.db/** binary
