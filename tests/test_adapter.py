@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from grafeo_langchain import GrafeoGraphVectorStore
@@ -150,6 +152,37 @@ class TestAdapterEdgeCases:
         store.add_texts(["new"], metadatas=[{"category": "new"}], ids=["doc"])
         docs = adapter._get(["doc"])
         assert [(d.page_content, d.metadata["category"]) for d in docs] == [("new", "new")]
+
+    def test_decimal_metadata_kept(
+        self, adapter: GrafeoAdapter, store: GrafeoGraphVectorStore, embedding: FakeEmbeddings
+    ) -> None:
+        # grafeo 0.6.0 returns a Decimal for a property a GQL query set with 9.99; the
+        # adapter dropped every value that was not str, int, float or bool
+        store.add_texts(["priced"], metadatas=[{"price": Decimal("1.50")}], ids=["priced"])
+        store._db.execute("MATCH (n:Document) SET n.discount = 9.99")
+        expected = (Decimal("1.50"), Decimal("9.99"))
+        for doc in [*adapter._get(["priced"]), *adapter._search(embedding.embed_query("priced"), k=1)]:
+            assert (doc.metadata["price"], doc.metadata["discount"]) == expected
+
+    def test_decimal_field_is_no_retriever_edge(self, adapter: GrafeoAdapter, store: GrafeoGraphVectorStore) -> None:
+        # README: langchain-graph-retriever 0.8 follows edges on str, bool, int and float
+        # values only, so it skips a Decimal field with a warning.  When this fails, the
+        # retriever supports decimals: update the README.
+        from graph_retriever.strategies import Eager
+        from langchain_graph_retriever import GraphRetriever
+
+        store.add_texts(
+            ["cheap pen", "cheap pencil", "dear watch"],
+            metadatas=[{"price": Decimal("1.50")}, {"price": Decimal("1.5")}, {"price": Decimal("99.00")}],
+            ids=["pen", "pencil", "watch"],
+        )
+        retriever = GraphRetriever(
+            store=adapter,
+            edges=[("price", "price")],
+            strategy=Eager(select_k=10, start_k=1, adjacent_k=10, max_depth=1),
+        )
+        with pytest.warns(UserWarning, match="Unsupported value 1.50 in 'price'"):
+            assert [d.id for d in retriever.invoke("cheap pen")] == ["pen"]
 
 
 class TestEagerTraversal:

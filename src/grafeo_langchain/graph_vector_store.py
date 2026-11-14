@@ -11,7 +11,7 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
 
-from grafeo_langchain._utils import matches_filter, merge_edge
+from grafeo_langchain._utils import METADATA_TYPES, matches_filter, merge_edge
 
 _LINK_KEY = "__graph_links__"
 _LABEL = "Document"
@@ -37,9 +37,10 @@ class GrafeoGraphVectorStore(VectorStore):
 
     Args:
         embedding: LangChain ``Embeddings`` instance for encoding text.
-        db_path: Path to a persistent database.  ``None`` for in-memory.  A path
-            ending in ``.grafeo`` is a single-file database; any other path is a
-            WAL-directory database.
+        db_path: Path to a persistent database file, ``None`` for in-memory.  The
+            database is one file at this path (``.grafeo`` is the usual extension),
+            with its write-ahead log in ``<db_path>.wal/`` while it is open.  A
+            database written by grafeo 0.5.x is migrated on open (see the README).
         embedding_dimensions: Dimensionality of the embedding vectors.  Auto-detected
             from the model if not provided.  When given, validated against the model.
     """
@@ -77,9 +78,8 @@ class GrafeoGraphVectorStore(VectorStore):
 
         self._check_stored_dimensions()
         # Built once, from the documents already stored (a reopened database), or
-        # empty.  Grafeo keeps it in sync with later writes; see _ensure_index.
+        # empty.  Grafeo keeps it in sync with later writes and deletes.
         self._db.create_vector_index(_LABEL, _EMBEDDING, dimensions=self._dims, metric="cosine")
-        self._index_stale = False
 
         # Counter for generated ids.  Ids in use are skipped (see _new_id).
         self._next_auto_id: int = self._db.execute("MATCH (n:Document) RETURN count(n) AS n").scalar() or 0
@@ -135,22 +135,17 @@ class GrafeoGraphVectorStore(VectorStore):
             meta = dict(meta)  # avoid mutating caller's dict
             links = meta.pop(_LINK_KEY, [])
             row: dict[str, Any] = {
-                k: v for k, v in meta.items() if k not in _RESERVED_KEYS and isinstance(v, str | int | float | bool)
+                k: v for k, v in meta.items() if k not in _RESERVED_KEYS and isinstance(v, METADATA_TYPES)
             }
             row.update({"doc_id": doc_id, "text": text, _EMBEDDING: vector})
             rows[doc_id] = row
             if links:
                 pending_links.append((doc_id, links))
 
-        stale = self._stale_properties(rows)
         # One statement for the batch: every row is written or none is.  A stored
-        # doc_id is updated in place, so its node keeps its edges.  Merge, not
-        # replace: replace=True removes and re-adds the embedding, and removing a
-        # vector damages Grafeo's HNSW graph (see _ensure_index).
-        self._db.upsert_nodes([_LABEL], list(rows.values()), key="doc_id", replace=False)
-        for gid, keys in stale:
-            for key in keys:
-                self._db.remove_node_property(gid, key)
+        # doc_id is updated in place, so its node keeps its edges; replace=True
+        # drops the metadata keys the new row no longer has.
+        self._db.upsert_nodes([_LABEL], list(rows.values()), key="doc_id", replace=True)
 
         # Links are created once every node of the batch exists, so they may
         # point forward within the batch.  Links to unknown ids are skipped.
@@ -219,7 +214,6 @@ class GrafeoGraphVectorStore(VectorStore):
         """MMR-diversified graph traversal using Grafeo's native MMR search."""
         query_vec = self._embedding.embed_query(query)
         self._check_dimensions(query_vec)
-        self._ensure_index()
 
         mmr_results = self._db.mmr_search(
             _LABEL,
@@ -283,36 +277,9 @@ class GrafeoGraphVectorStore(VectorStore):
             return False
         # DETACH: Grafeo refuses to delete a node that still has edges.
         result = self._db.execute("MATCH (n) WHERE id(n) IN $ids DETACH DELETE n", {"ids": node_ids})
-        deleted = result.counters["nodes_deleted"] > 0
-        if deleted:
-            self._index_stale = True
-        return deleted
+        return result.counters["nodes_deleted"] > 0
 
     # ── Internals ─────────────────────────────────────────────────────────────
-
-    def _ensure_index(self) -> None:
-        """Rebuild the vector index before a search if documents were deleted.
-
-        Grafeo (0.5.44, unchanged on 0.6.0) removes a deleted vector from its
-        HNSW graph without reconnecting that vector's neighbors, so other
-        documents can drop out of every search.  Writes need no rebuild.
-        """
-        if self._index_stale:
-            self._db.rebuild_vector_index(_LABEL, _EMBEDDING)
-            self._index_stale = False
-
-    def _stale_properties(self, rows: dict[str, dict[str, Any]]) -> list[tuple[int, list[str]]]:
-        """Return the properties of stored documents that the new rows no longer have."""
-        stale: list[tuple[int, list[str]]] = []
-        for doc_id, row in rows.items():
-            for gid in self._db.find_nodes_by_property("doc_id", doc_id):
-                node = self._db.get_node(gid)
-                if node is None:
-                    continue
-                keys = [key for key in node.properties() if key not in row]
-                if keys:
-                    stale.append((gid, keys))
-        return stale
 
     def _check_dimensions(self, vector: list[float]) -> None:
         # Grafeo panics (instead of raising) on a search vector of the wrong size.
@@ -358,7 +325,6 @@ class GrafeoGraphVectorStore(VectorStore):
         filter: dict[str, Any] | None,
     ) -> list[tuple[int, Document]]:
         self._check_dimensions(embedding)
-        self._ensure_index()
         return self._to_hits(self._db.vector_search(_LABEL, _EMBEDDING, embedding, k, filters=filter))
 
     def _to_hits(self, results: list[tuple[int, float]]) -> list[tuple[int, Document]]:

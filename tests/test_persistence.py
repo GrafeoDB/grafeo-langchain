@@ -2,15 +2,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import grafeo
 import pytest
 
-from grafeo_langchain import GrafeoGraphVectorStore
+from grafeo_langchain import GrafeoGraphStore, GrafeoGraphVectorStore
 
 from .conftest import DIMS, FakeEmbeddings
 
-# A ".grafeo" path is a single-file database; any other path a WAL directory,
-# which keeps no indexes across a reopen before grafeo 0.6.0.
-pytestmark = pytest.mark.parametrize("suffix", [".grafeo", ".db"], ids=["single-file", "wal-directory"])
+# grafeo 0.6: every database is one file, whatever the extension of its path (0.5.x made a
+# WAL directory for a path without ".grafeo").
+pytestmark = pytest.mark.parametrize("suffix", [".grafeo", ".db"], ids=["grafeo-extension", "other-extension"])
 
 
 def _ids(store: GrafeoGraphVectorStore) -> list[str]:
@@ -33,6 +34,8 @@ class TestPersistenceRoundTrip:
         store = GrafeoGraphVectorStore(embedding, db_path=db_path)
         store.add_texts(texts, metadatas=metadatas, ids=ids)
         store.close()
+        assert sorted(p.name for p in tmp_path.iterdir()) == [f"test{suffix}"], "one file, no WAL left after close"
+        assert Path(db_path).is_file()
 
         # Reopen phase
         store2 = GrafeoGraphVectorStore(embedding, db_path=db_path)
@@ -127,3 +130,25 @@ class TestReopenWithOtherModel:
         # the database is left as it was
         with GrafeoGraphVectorStore(FakeEmbeddings(dims=DIMS), db_path=db_path) as store:
             assert _ids(store) == ["a"]
+
+
+class TestPathIsADirectory:
+    """grafeo 0.6 refuses a directory that is not a 0.5.x database, an empty one included."""
+
+    def test_vector_store(self, tmp_path: Path, suffix: str) -> None:
+        directory = tmp_path / f"folder{suffix}"
+        directory.mkdir()
+        with pytest.raises(grafeo.GrafeoError, match="not a database file"):
+            GrafeoGraphVectorStore(FakeEmbeddings(dims=DIMS), db_path=str(directory))
+        assert list(directory.iterdir()) == []
+        # a file inside the directory is the way to go
+        with GrafeoGraphVectorStore(FakeEmbeddings(dims=DIMS), db_path=str(directory / f"store{suffix}")) as store:
+            store.add_texts(["a"], ids=["a"])
+        assert (directory / f"store{suffix}").is_file()
+
+    def test_graph_store(self, tmp_path: Path, suffix: str) -> None:
+        directory = tmp_path / f"folder{suffix}"
+        directory.mkdir()
+        with pytest.raises(grafeo.GrafeoError, match="not a database file"):
+            GrafeoGraphStore(db_path=str(directory))
+        assert list(directory.iterdir()) == []

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import cast
 
 import grafeo
@@ -628,7 +629,8 @@ class TestEmptyStore:
 
 
 class TestSearchAfterDelete:
-    """Grafeo's HNSW index can lose live vectors when one is removed: the store rebuilds it."""
+    """grafeo 0.5.44 could lose live vectors when one was removed, so 0.2 rebuilt the index
+    after deletes.  grafeo 0.6 keeps them reachable (#600) and the store no longer rebuilds."""
 
     @pytest.mark.parametrize("deleted", [["d1"], ["d2"], ["d1", "d2"], ["d0", "d4"]])
     def test_every_remaining_document_found(self, store: GrafeoGraphVectorStore, deleted: list[str]) -> None:
@@ -652,6 +654,15 @@ class TestSearchAfterDelete:
         store.add_texts([f"document {i}" for i in range(5)], ids=ids)
         store.add_texts(["replaced one", "replaced two"], ids=["d1", "d2"])
         assert {d.id for d in store.similarity_search("document", k=10)} == set(ids)
+
+    def test_repeated_deletes_and_searches(self, store: GrafeoGraphVectorStore) -> None:
+        ids = [f"d{i}" for i in range(60)]
+        store.add_texts([f"document {i}" for i in range(60)], ids=ids)
+        remaining = set(ids)
+        for start in range(0, 60, 6):
+            store.delete(ids[start : start + 2])
+            remaining -= set(ids[start : start + 2])
+            assert {d.id for d in store.similarity_search("document", k=60)} == remaining
 
 
 # ── Delete with graph links ─────────────────────────────────────────────────
@@ -791,3 +802,62 @@ class TestFactoryIds:
         docs = [Document(page_content=t, id=f"doc-{i}") for i, t in enumerate(TEXTS[:2])]
         store = GrafeoGraphVectorStore.from_documents(docs, embedding, ids=["x", "y"])
         assert _doc_ids(store) == ["x", "y"]
+
+
+# ── Decimals (grafeo 0.6.0) ─────────────────────────────────────────────────
+
+
+class TestDecimalMetadata:
+    """grafeo 0.6.0 stores a Decimal exactly; 0.2 dropped Decimal metadata."""
+
+    @pytest.fixture(autouse=True)
+    def _populate(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(
+            ["cheap pen", "cheap pencil", "dear watch"],
+            metadatas=[
+                {"price": Decimal("1.50"), "__graph_links__": [{"target_id": "pencil"}, {"target_id": "watch"}]},
+                {"price": Decimal("1.5")},
+                {"price": 1.5},
+            ],
+            ids=["pen", "pencil", "watch"],
+        )
+
+    def test_returned_as_stored(self, store: GrafeoGraphVectorStore) -> None:
+        prices = {d.id: d.metadata["price"] for d in store.similarity_search("x", k=3)}
+        assert prices == {"pen": Decimal("1.50"), "pencil": Decimal("1.5"), "watch": 1.5}
+        assert str(prices["pen"]) == "1.50", "a decimal keeps its scale"
+        assert type(prices["watch"]) is float
+
+    def test_filter(self, store: GrafeoGraphVectorStore) -> None:
+        by_decimal = {d.id for d in store.similarity_search("x", k=3, filter={"price": Decimal("1.5")})}
+        by_float = {d.id for d in store.similarity_search("x", k=3, filter={"price": 1.5})}
+        assert (by_decimal, by_float) == ({"pen", "pencil"}, {"watch"})
+
+    def test_traversal_filter(self, store: GrafeoGraphVectorStore) -> None:
+        # the filter applies to linked documents through _utils.matches_filter, which
+        # compares the way grafeo 0.6.0's vector search filters do
+        docs = store.traversal_search("cheap pen", k=1, depth=1, filter={"price": Decimal("1.5")})
+        assert [d.id for d in docs] == ["pen", "pencil"]
+
+
+# ── Result order ────────────────────────────────────────────────────────────
+
+
+class TestTraversalResultOrder:
+    """Vector hits (with a score) come first, closest first; linked documents (score None) after them.
+
+    The store sorts linked documents itself, so GQL's null ordering (nulls last since grafeo 0.6)
+    plays no part.
+    """
+
+    @pytest.mark.usefixtures("shuffled_rows")
+    def test_scored_documents_before_unscored(self, embedding: FakeEmbeddings) -> None:
+        store = GrafeoGraphVectorStore(embedding)
+        _build_tree(store)
+        for _ in range(5):
+            docs = store.traversal_search("seed", k=3, depth=2)
+            scores = [d.metadata["score"] for d in docs]
+            scored = [score for score in scores if score is not None]
+            assert scores[: len(scored)] == scored, f"a document without a score came before a scored one: {scores}"
+            assert scored == sorted(scored, reverse=True)
+            assert all(d.metadata["source"] == "graph_traversal" for d in docs[len(scored) :])

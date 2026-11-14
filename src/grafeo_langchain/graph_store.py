@@ -12,7 +12,7 @@ from typing import Any
 import grafeo
 from langchain_core.documents import Document
 
-from grafeo_langchain._utils import merge_edge
+from grafeo_langchain._utils import METADATA_TYPES, merge_edge
 from grafeo_langchain.graph_document import GraphDocument, Node
 
 
@@ -23,9 +23,10 @@ class GrafeoGraphStore:
     graph elements.  Supports GQL and Cypher queries.
 
     Args:
-        db_path: Path to a persistent database.  ``None`` for in-memory.  A path
-            ending in ``.grafeo`` is a single-file database; any other path is a
-            WAL-directory database.
+        db_path: Path to a persistent database file, ``None`` for in-memory.  The
+            database is one file at this path (``.grafeo`` is the usual extension),
+            with its write-ahead log in ``<db_path>.wal/`` while it is open.  A
+            database written by grafeo 0.5.x is migrated on open (see the README).
     """
 
     def __init__(self, *, db_path: str | None = None) -> None:
@@ -80,8 +81,8 @@ class GrafeoGraphStore:
         """
         raw = self._db.schema()
         self._schema = {
-            "labels": _names_in_use(raw.get("labels", [])),
-            "edge_types": _names_in_use(raw.get("edge_types", [])),
+            "labels": sorted(entry["name"] for entry in raw.get("labels", [])),
+            "edge_types": sorted(entry["name"] for entry in raw.get("edge_types", [])),
             "property_keys": sorted(raw.get("property_keys", [])),
         }
 
@@ -154,7 +155,7 @@ class GrafeoGraphStore:
         props: dict[str, Any] = {
             "node_id": node_id,
             "text": doc.page_content[:5000],
-            **{k: v for k, v in doc.metadata.items() if isinstance(v, str | int | float | bool)},
+            **{k: v for k, v in doc.metadata.items() if isinstance(v, METADATA_TYPES)},
         }
         return self._db.create_node(["SourceDocument"], props).id
 
@@ -167,12 +168,6 @@ class GrafeoGraphStore:
 
     def __exit__(self, *args: Any) -> None:
         self.close()
-
-
-def _names_in_use(entries: list[dict[str, Any]]) -> list[str]:
-    # Grafeo keeps a label or edge type in its schema, with a count of 0, after
-    # its last node or edge is deleted.
-    return sorted(entry["name"] for entry in entries if entry.get("count", 1) > 0)
 
 
 def _source_id(doc: Document) -> str:

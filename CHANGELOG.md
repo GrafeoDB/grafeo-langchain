@@ -1,22 +1,61 @@
 # Changelog
 
-## Unreleased
+All notable changes to grafeo-langchain, LangChain graph and vector stores backed by the Grafeo embedded graph database.
 
-Aligned with grafeo 0.5.44 and prepared for grafeo 0.6.0. Fixes for repeated ingestion, deletes
-and vector search, an engine contract test suite and a weekly run against the newest grafeo.
+## [0.3.0] - 2026-11-14
+
+Storage and correctness release: grafeo-langchain runs on grafeo 0.6 (`grafeo>=0.6.2,<0.7`) and its single-file database format, and repeated ingestion, deletes and vector search are fixed. Before upgrading: a database written by grafeo 0.5.x is migrated on first open and grafeo 0.5.x cannot open it afterwards (back it up first, see "Upgrading from grafeo 0.5" in the README), a `db_path` that is an existing directory raises `grafeo.GrafeoError`, and `GrafeoGraphStore.query` returns results with grafeo 0.6 semantics. A store that stays on grafeo 0.5 stays on grafeo-langchain 0.2 and pins `grafeo<0.6`.
 
 ### Added
 
+- `decimal.Decimal` metadata values are stored (grafeo 0.6 keeps them exact, with their scale) and
+  returned, by both stores and by `GrafeoAdapter`, and work as filter values: `Decimal("1.5")`
+  matches a stored `Decimal("1.50")`, not the float `1.5`. They were dropped before.
 - Returned documents carry their id in `Document.id`, besides `metadata["id"]`.
-- `tests/test_grafeo_contract.py`: the grafeo behavior this package relies on (upserts, vector
-  index sync, filter semantics, `DETACH DELETE`, result counters, traversal ordering, schema shape,
-  persistence of single-file and WAL-directory databases), each with a message naming the code that
-  depends on it.
-- Tests for repeated ingestion, deletes with links, persistence in both storage formats, generated
-  ids, dimension checks, traversal order under shuffled row order and the `[retriever]` extra with
-  Eager traversal.
+- `tests/test_grafeo_contract.py`: the grafeo behavior this package relies on (replacing upserts,
+  vector index sync after writes and deletes, filter semantics, decimals, null ordering,
+  `DETACH DELETE`, result counters, traversal ordering, schema shape, single-file persistence), each
+  with a message naming the code that depends on it.
+- `tests/test_migration.py`: stores written by grafeo-langchain 0.2.0 on grafeo 0.5.44 (a file and
+  a WAL directory, in `tests/fixtures/`, made by `tests/fixtures/make_grafeo_0_5_fixtures.py`) open
+  with grafeo 0.6 with their documents, vectors and links, and keep the old files as `.pre-0.6`.
+- Tests for repeated ingestion, deletes with links, persistence, generated ids, dimension checks,
+  traversal order under shuffled row order, decimals in results and metadata, and the `[retriever]`
+  extra with Eager traversal.
 - Weekly CI workflow (`grafeo-latest.yml`, also run by hand) that tests against the newest grafeo on
   PyPI, pre-releases included, both within the supported range and past it.
+- Python classifiers for 3.12 to 3.14. The suite passes on Python 3.15, which CI also runs but
+  allows to fail: zstandard, which langchain-core needs through langsmith, has no 3.15 wheels yet
+  and installs only where it can be compiled.
+
+### Changed
+
+The first four entries change behavior on upgrade and may need action.
+
+- Requires grafeo 0.6 (`grafeo>=0.6.2,<0.7`; was `>=0.5`). The first time grafeo 0.6 opens a
+  store written by grafeo 0.5.x, it migrates the database in place and keeps the old files as
+  `<file>.pre-0.6` (a WAL directory as `<path>.pre-0.6/`). grafeo 0.5.x cannot open the migrated
+  database: stop every process that uses it with 0.5.x and back it up before upgrading. See
+  "Upgrading from grafeo 0.5" in the README.
+- A `db_path` without the `.grafeo` extension is a single file too: grafeo 0.5 made a WAL
+  directory there. An existing WAL directory becomes a file at the same path on first open.
+- A `db_path` that is an existing directory, an empty one included, raises `grafeo.GrafeoError`
+  (grafeo 0.5 created a database in it): pass a file path inside it.
+- `GrafeoGraphStore.query` runs GQL with grafeo 0.6 semantics: a number with a point (`9.99`) is
+  an exact decimal and comes back as `decimal.Decimal`, also once stored as a property; integer and
+  decimal overflow and division by zero raise `grafeo.GrafeoError` instead of returning null;
+  `ORDER BY ... DESC` puts nulls last; a `WHERE` right after `INSERT`, `CREATE`, `MERGE` or `DELETE`
+  is an error. Queries that relied on the old behavior need changing.
+- `add_texts` writes each batch with one replacing `upsert_nodes` call: all documents of a batch are
+  stored, with the metadata keys a replaced document no longer has removed, or none is.
+- The vector index is no longer rebuilt after every write, nor after deletes: grafeo keeps it in
+  sync.
+- README: single-file databases, upgrading from grafeo 0.5 (migration, backups, `.pre-0.6`), GQL
+  results under grafeo 0.6, metadata types, re-ingestion and upsert semantics, type-strict filters.
+- CI: `actions/checkout` v7, `astral-sh/setup-uv` v10, `codecov/codecov-action` v7; the ruff
+  pre-commit hook is v0.17.1.
+- Development dependencies moved from `[tool.uv] dev-dependencies` to `[dependency-groups]`.
+- `examples/graph_retriever_demo.py` passes an explicit `Eager` strategy.
 
 ### Fixed
 
@@ -31,9 +70,9 @@ and vector search, an engine contract test suite and a weekly run against the ne
 - Vector index errors were swallowed (`contextlib.suppress(RuntimeError)`): reopening a database
   with an embedding model of another dimensionality now raises `ValueError` and leaves the
   database closed, instead of failing later with "No vector index found".
-- Documents could drop out of every vector search after a delete, because grafeo removes a vector
-  from its HNSW graph without reconnecting its neighbors. The store rebuilds the index before the
-  next search after a delete.
+- Documents could drop out of every vector search after a delete or a replaced embedding, because
+  grafeo 0.5 removed a vector from its HNSW graph without reconnecting its neighbors (grafeo #600).
+  grafeo 0.6 fixes it; the store relies on that and does not rebuild the index.
 - `add_texts` with an id that is already stored created a second document with that id (returned
   twice by searches, and linked twice). It now replaces the stored document in place, keeping its
   graph links, and a repeated id within one batch keeps the last text.
@@ -59,20 +98,14 @@ and vector search, an engine contract test suite and a weekly run against the ne
 - `traversal_search` and `mmr_traversal_search` reject a `depth` that is not an integer instead of
   formatting it into the query text.
 
-### Changed
+### Dependencies
 
-- Requires `grafeo>=0.5.44,<0.7` (tested against 0.5.44); the lock file resolves grafeo 0.5.44.
-- `add_texts` writes each batch with one `upsert_nodes` call: all documents of a batch are stored,
-  or none.
-- The vector index is no longer rebuilt after every write: grafeo keeps it in sync.
-- README: `.grafeo` paths for single-file databases (other paths create a WAL directory, deprecated
-  as of grafeo 0.6), upgrading to grafeo 0.6, re-ingestion and upsert semantics, type-strict filters.
-- Development dependencies moved from `[tool.uv] dev-dependencies` to `[dependency-groups]`.
-- `examples/graph_retriever_demo.py` passes an explicit `Eager` strategy.
+- **grafeo 0.6.2** (`grafeo>=0.6.2,<0.7`; 0.2.0 required `>=0.5`).
+- **Lockfile**: grafeo 0.6.2, langchain-core 1.8.0, langchain 1.5.0 and langchain-graph-retriever 0.8.0; development tools pytest 9.2, ruff 0.17 and ty 0.0.104.
 
-## 0.2.0 - 2026-04-12
+## [0.2.0] - 2026-04-12
 
-Aligned with grafeo 0.5.37. New features, test coverage and documentation improvements.
+Feature release: aligned with grafeo 0.5.37, with new features, test coverage and documentation improvements.
 
 ### Added
 
@@ -96,13 +129,6 @@ Aligned with grafeo 0.5.37. New features, test coverage and documentation improv
 - Delete and rebuild test: similarity search correct after partial deletion
 - Large batch test: 500 documents added and verified
 
-### Fixed
-
-- Graph link ordering: links to target documents now resolve correctly regardless
-  of insertion order within the same `add_texts` batch (two-pass approach).
-- Persistent store reopen: existing Document nodes now detected on constructor, vector index rebuilt before first search
-- `langchain-graph-retriever` optional floor bumped from `>=0.3` to `>=0.8` to match dev pin
-
 ### Changed
 
 - Requires grafeo >=0.5 (tested against 0.5.37)
@@ -112,6 +138,18 @@ Aligned with grafeo 0.5.37. New features, test coverage and documentation improv
 - README: added `__graph_links__` metadata key format reference table
 - 79 tests passing, 98% coverage
 
-## 0.1.1
+### Fixed
+
+- Graph link ordering: links to target documents now resolve correctly regardless
+  of insertion order within the same `add_texts` batch (two-pass approach).
+- Persistent store reopen: existing Document nodes now detected on constructor, vector index rebuilt before first search
+- `langchain-graph-retriever` optional floor bumped from `>=0.3` to `>=0.8` to match dev pin
+
+## [0.1.1] - 2026-02-11
 
 - Initial release with `GrafeoGraphStore` and `GrafeoGraphVectorStore`.
+
+---
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).

@@ -9,7 +9,7 @@ from langchain_core.documents import Document
 from langchain_graph_retriever._conversion import METADATA_EMBEDDING_KEY
 from langchain_graph_retriever.adapters.langchain import LangchainAdapter
 
-from grafeo_langchain._utils import matches_filter
+from grafeo_langchain._utils import METADATA_TYPES, matches_filter
 from grafeo_langchain.graph_vector_store import GrafeoGraphVectorStore
 
 
@@ -44,7 +44,6 @@ class GrafeoAdapter(LangchainAdapter[GrafeoGraphVectorStore]):
     ) -> list[Document]:
         store = self.vector_store
         store._check_dimensions(embedding)
-        store._ensure_index()
         results = store._db.vector_search(
             "Document",
             "embedding",
@@ -80,7 +79,7 @@ class GrafeoAdapter(LangchainAdapter[GrafeoGraphVectorStore]):
                     "id": doc_id,
                 }
                 for key, val in props.items():
-                    if isinstance(val, str | int | float | bool):
+                    if isinstance(val, METADATA_TYPES):
                         meta[key] = val
 
                 docs.append(Document(id=doc_id, page_content=text, metadata=meta))
@@ -109,7 +108,7 @@ class GrafeoAdapter(LangchainAdapter[GrafeoGraphVectorStore]):
                 "score": 1.0 - distance,
             }
             for key, val in props.items():
-                if isinstance(val, str | int | float | bool):
+                if isinstance(val, METADATA_TYPES):
                     meta[key] = val
 
             docs.append(Document(id=doc_id, page_content=text, metadata=meta))
