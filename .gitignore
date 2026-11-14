@@ -39,3 +39,6 @@ htmlcov/
 *.db
 *.grafeo
 *.grafeo.*
+
+# grafeo 0.5.44 databases the migration tests open (tests/fixtures/make_grafeo_0_5_fixtures.py)
+!tests/fixtures/**
