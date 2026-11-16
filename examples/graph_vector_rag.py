@@ -1,114 +1,94 @@
-"""GraphVectorStore with traversal, filtering, and deletion.
+"""GrafeoGraphVectorStore over the Silicon Valley dataset: search, traversal, filters and deletes.
 
 Demonstrates:
-- Auto-detected embedding dimensions (no manual config needed)
-- Adding documents with embeddings and graph links
-- Similarity search (pure vector)
-- Traversal search (vector seeds + graph walk)
-- MMR traversal search (diversified + graph walk)
-- Metadata filtering
-- Document deletion
+- The 64 dataset descriptions as documents, its 149 edges as graph links
+- Auto-detected embedding dimensions
+- Similarity search, traversal search (search hits, then linked documents) and MMR traversal
+- Metadata filters, the MMR retriever, and deleting a document with its links
 
-Uses a simple hash-based embedding so no API key is needed.
-
-Run:
-    uv run python examples/graph_vector_rag.py
+Uses Mistral embeddings when MISTRAL_API_KEY is set, and an offline keyword stand-in otherwise. Run:
+    uv run python examples/graph_vector_rag.py                                # no API key
+    uv run --with langchain-mistralai python examples/graph_vector_rag.py    # with MISTRAL_API_KEY
 """
 
 from __future__ import annotations
 
 import hashlib
+import importlib
+import os
+import re
 
+from grafeo_datasets import silicon_valley
 from langchain_core.embeddings import Embeddings
 
 from grafeo_langchain import GrafeoGraphVectorStore
 
-DIMS = 32
 
+class KeywordEmbeddings(Embeddings):
+    """Offline stand-in for an embedding model: texts that share words come out close."""
 
-class DemoEmbeddings(Embeddings):
-    """Deterministic hash-based embeddings for demo purposes."""
+    def __init__(self, dims: int = 512) -> None:
+        self.dims = dims
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return [self._embed(t) for t in texts]
+        return [self.embed_query(text) for text in texts]
 
     def embed_query(self, text: str) -> list[float]:
-        return self._embed(text)
+        vector = [0.0] * self.dims
+        for word in re.findall(r"[a-z]{3,}", text.lower()):
+            vector[int(hashlib.md5(word.encode()).hexdigest(), 16) % self.dims] += 1.0
+        return vector if any(vector) else [1.0] + [0.0] * (self.dims - 1)
 
-    def _embed(self, text: str) -> list[float]:
-        digest = hashlib.sha256(text.encode()).digest()
-        return [b / 255.0 for b in digest[:DIMS]]
+
+def pick_embeddings() -> Embeddings:
+    if os.environ.get("MISTRAL_API_KEY"):
+        # optional (uv run --with langchain-mistralai): imported by name, so type checkers do not require it
+        MistralAIEmbeddings = importlib.import_module("langchain_mistralai").MistralAIEmbeddings
+        print("Embeddings: Mistral (mistral-embed)")
+        return MistralAIEmbeddings(model="mistral-embed")
+    print("Embeddings: offline keyword stand-in (set MISTRAL_API_KEY to use Mistral)")
+    return KeywordEmbeddings()
 
 
-# ── Create store and add documents with graph links ────────────────────────────
+def show(title: str, docs: list) -> None:
+    print(f"\n=== {title} ===")
+    for doc in docs:
+        hop = "hit" if doc.metadata["_depth"] == 0 else f"{doc.metadata['_depth']} hop"
+        print(f"  [{doc.id}] ({hop}) {doc.page_content[:70]}...")
 
-embeddings = DemoEmbeddings()
-store = GrafeoGraphVectorStore(embedding=embeddings)  # dimensions auto-detected
 
+# ── Documents and links from the dataset ───────────────────────────────────────
+
+nodes = silicon_valley.nodes()
+links: dict[str, list[dict[str, str]]] = {}
+for edge in silicon_valley.edges():
+    links.setdefault(edge["source"], []).append({"target_id": edge["target"], "type": edge["type"]})
+
+store = GrafeoGraphVectorStore(embedding=pick_embeddings())
 store.add_texts(
-    texts=[
-        "Python is a high-level programming language created by Guido van Rossum.",
-        "Guido van Rossum started developing Python in the late 1980s.",
-        "ABC was a programming language that heavily influenced Python's design.",
-        "Rust is a systems programming language focused on safety and performance.",
-        "TypeScript is a typed superset of JavaScript developed by Microsoft.",
-    ],
+    texts=[node["description"] for node in nodes],
     metadatas=[
-        {"__graph_links__": [{"target_id": "abc", "type": "INFLUENCED_BY"}]},
-        {},
-        {"__graph_links__": [{"target_id": "python", "type": "INFLUENCED"}]},
-        {},
-        {},
+        {"label": node["label"], "name": node["name"], "__graph_links__": links.get(node["key"], [])} for node in nodes
     ],
-    ids=["python", "guido", "abc", "rust", "typescript"],
+    ids=[node["key"] for node in nodes],
 )
+print(f"{len(nodes)} documents")
 
-# ── Similarity search (pure vector) ───────────────────────────────────────────
-
-print("=== Similarity Search ===")
-docs = store.similarity_search("programming languages", k=3)
-for doc in docs:
-    print(f"  [{doc.metadata.get('id', '?')}] {doc.page_content[:80]}...")
-print()
-
-# ── Traversal search (vector + graph links) ───────────────────────────────────
-
-print("=== Traversal Search (depth=1) ===")
-docs = store.traversal_search("Python programming", k=2, depth=1)
-for doc in docs:
-    source = doc.metadata.get("source", "vector")
-    print(f"  [{source}] {doc.page_content[:80]}...")
-print()
-
-# ── MMR traversal search (diversified + graph) ────────────────────────────────
-
-print("=== MMR Traversal Search ===")
-docs = store.mmr_traversal_search("programming", k=3, depth=1, lambda_mult=0.5)
-for doc in docs:
-    score = doc.metadata.get("score", "n/a")
-    print(f"  [score={score}] {doc.page_content[:80]}...")
-
-# ── Filtered search ──────────────────────────────────────────────────────────
-
-print()
-print("=== Filtered Search ===")
-store2 = GrafeoGraphVectorStore(embedding=embeddings)
-store2.add_texts(
-    ["Python is a scripting language", "Rust is a systems language", "Go is compiled"],
-    metadatas=[{"category": "scripting"}, {"category": "systems"}, {"category": "systems"}],
-    ids=["py", "rs", "go"],
+show("An AI trained to write and fix software", store.similarity_search("an AI trained to write and fix software", k=2))
+show(
+    "Pied Piper's systems architect, then what he built",
+    store.traversal_search("Pied Piper's systems architect who trusts his server", k=1, depth=1),
 )
-docs = store2.similarity_search("language", k=3, filter={"category": "systems"})
-for doc in docs:
-    print(f"  [{doc.metadata.get('id')}] {doc.page_content}")
+show(
+    "Apps that recognise food in photos (MMR)",
+    store.mmr_traversal_search("apps that recognise food in photos", k=2, depth=1),
+)
+show(
+    "A machine with a voice, AIs only",
+    store.similarity_search("a machine with a screen and a voice", k=2, filter={"label": "AI"}),
+)
+show("MMR retriever: Hooli", store.as_retriever(search_type="mmr", search_kwargs={"k": 2}).invoke("Hooli's products"))
 
-# ── Delete ───────────────────────────────────────────────────────────────────
-
-print()
-print("=== Delete ===")
-print(f"  Before delete: {len(store2.similarity_search('language', k=10))} docs")
-store2.delete(["py"])
-print(f"  After deleting 'py': {len(store2.similarity_search('language', k=10))} docs")
-
-store.close()
-store2.close()
+store.delete(["russ-car"])
+print("\n=== Delete ===")
+print("  russ-car left:", store.get_by_ids(["russ-car"]) != [])
