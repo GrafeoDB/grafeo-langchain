@@ -14,8 +14,13 @@ from grafeo_langchain import GraphDocument, Node, Relationship
 DIMS = 4
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    # Also in pyproject.toml; registered here too so the tests of an unpacked sdist run without warnings.
+    config.addinivalue_line("markers", "integration: tests requiring real embedding models and API keys")
+
+
 class FakeEmbeddings(Embeddings):
-    """Deterministic embeddings for testing — no model required."""
+    """Deterministic embeddings for testing: no model required."""
 
     def __init__(self, dims: int = DIMS) -> None:
         self.dims = dims

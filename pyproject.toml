@@ -38,6 +38,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/grafeo_langchain"]
 
+[tool.hatch.build.targets.sdist]
+include = ["src/", "tests/", "examples/", "CHANGELOG.md", "CONTRIBUTING.md"]
+
 # ── Ruff ──────────────────────────────────────────────────────────────────────
 [tool.ruff]
 target-version = "py312"
@@ -77,6 +80,7 @@ dev = [
     "ty>=0.0.16",
     "langchain>=1.2",
     "langchain-graph-retriever>=0.8",
+    "grafeo-datasets>=0.6.3",
 ]
 
 [tool.uv.sources]

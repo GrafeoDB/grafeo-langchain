@@ -14,6 +14,11 @@ METADATA_TYPES = (str, int, float, bool, Decimal)
 _FIND_EDGES = "MATCH (s)-[r]->(t) WHERE id(s) = $src AND id(t) = $dst AND type(r) = $type RETURN id(r) AS rid"
 
 
+def relevance(distance: float) -> float:
+    """Map a cosine distance (0 to 2) to a relevance score from 0 to 1: 1 is identical, 0.5 unrelated, 0 opposite."""
+    return 1.0 - distance / 2.0
+
+
 def merge_edge(
     db: grafeo.GrafeoDB,
     src: int,

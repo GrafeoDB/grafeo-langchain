@@ -1,68 +1,82 @@
-"""Basic GrafeoGraphStore usage: knowledge graph from structured data.
+"""GrafeoGraphStore on the Silicon Valley dataset: load a graph, query it with GQL, add your own facts.
 
 Demonstrates:
-- Creating a graph store (in-memory)
-- Ingesting graph documents with nodes and relationships
-- Querying with GQL/Cypher
-- Inspecting the schema
+- Loading the grafeo-datasets Silicon Valley graph (Pied Piper, 64 nodes, 149 edges) into a store
+- The schema text an LLM would see
+- GQL queries: a two-hop path, investors in date order, properties
+- Adding your own facts as graph documents, idempotently
 
-Run:
+No API key needed. Run:
     uv run python examples/basic_graph_store.py
 """
 
 from __future__ import annotations
 
+from grafeo_datasets import silicon_valley
 from langchain_core.documents import Document
 
 from grafeo_langchain import GrafeoGraphStore, GraphDocument, Node, Relationship
 
-# ── Build graph documents ──────────────────────────────────────────────────────
+# ── The dataset ───────────────────────────────────────────────────────────────
 
-alice = Node(id="alice", type="Person", properties={"name": "Alice", "role": "Engineer"})
-bob = Node(id="bob", type="Person", properties={"name": "Bob", "role": "Manager"})
-acme = Node(id="acme", type="Company", properties={"name": "Acme Corp", "industry": "Tech"})
+store = GrafeoGraphStore()
+silicon_valley.load(store.client)
 
-source = Document(page_content="Alice and Bob work at Acme Corp. Alice knows Bob.")
+schema = store.get_schema.splitlines()
+print("=== Schema (first lines of what an LLM sees) ===")
+print("\n".join(schema[:4]), "\n  ...", f"({len(schema)} lines)")
 
-graph_doc = GraphDocument(
-    nodes=[alice, bob, acme],
+print("\n=== How is Son of Anton related to Anton? ===")
+for row in store.query(
+    "MATCH (:AI {name: 'Son of Anton'})<-[:BUILT]-(p:Person)-[:BUILT]->(:AI {name: 'Anton'}) RETURN p.name AS builder"
+):
+    print(f"  {row['builder']} built both")
+
+print("\n=== Who invested in Pied Piper? ===")
+for row in store.query(
+    "MATCH (i)-[e:INVESTED_IN]->(:Company {name: 'Pied Piper'}) RETURN i.name AS investor, e.round AS round "
+    "ORDER BY e.date"
+):
+    print(f"  {row['investor']} ({row['round']})")
+
+print("\n=== Does Jian-Yang's fridge talk? ===")
+for row in store.query(
+    'MATCH (f:AI {name: "Jian-Yang\'s fridge"})<-[:OWNS]-(p) RETURN p.name AS owner, f.talks AS talks'
+):
+    print(f"  talks: {row['talks']}, owned by {row['owner']}")
+
+print("\n=== Who has the most commas? ===")
+for row in store.query(
+    "MATCH (p:Person) WHERE p.net_worth_commas IS NOT NULL "
+    "RETURN p.name AS person, p.net_worth_commas AS commas ORDER BY commas DESC LIMIT 1"
+):
+    print(f"  {row['person']}: {row['commas']} commas")
+
+print("\n=== Rivals ===")
+for row in store.query("MATCH (a)-[:RIVAL_OF]->(b) RETURN a.name AS a, b.name AS b ORDER BY a, b"):
+    print(f"  {row['a']} vs {row['b']}")
+
+# ── Your own facts ────────────────────────────────────────────────────────────
+
+episodes = GrafeoGraphStore()
+gavin = Node(id="Gavin Belson", type="Person", properties={"pledge": "Tethics"})
+jack = Node(id="Jack Barker", type="Person", properties={"nickname": "Action Jack"})
+hooli = Node(id="Hooli", type="Company", properties={"motto": "Making the world a better place"})
+episode = GraphDocument(
+    nodes=[gavin, jack, hooli],
     relationships=[
-        Relationship(source=alice, target=acme, type="WORKS_AT"),
-        Relationship(source=bob, target=acme, type="WORKS_AT"),
-        Relationship(source=alice, target=bob, type="KNOWS"),
+        Relationship(source=gavin, target=hooli, type="FOUNDED"),
+        Relationship(source=jack, target=hooli, type="LEADS", properties={"role": "CEO"}),
     ],
-    source=source,
+    source=Document(page_content="Gavin Belson founded Hooli. Jack Barker took over as its CEO.", id="season-3"),
 )
+episodes.add_graph_documents([episode], include_source=True)
+episodes.add_graph_documents([episode], include_source=True)  # again: updates, does not duplicate
 
-# ── Ingest into graph store ────────────────────────────────────────────────────
-
-store = GrafeoGraphStore()  # in-memory
-store.add_graph_documents([graph_doc], include_source=True)
-
-# ── Query the graph ────────────────────────────────────────────────────────────
-
-print("=== Schema ===")
-print(store.get_schema)
-print()
-
-print("=== Who works at Acme? ===")
-results = store.query("MATCH (p:Person)-[:WORKS_AT]->(c:Company) RETURN p.name, c.name")
-for row in results:
-    print(f"  {row}")
-
-print()
-print("=== Who does Alice know? ===")
-results = store.query("MATCH (a {node_id: 'alice'})-[:KNOWS]->(b) RETURN b.name")
-for row in results:
-    print(f"  {row}")
-
-print()
-print("=== Upsert: update Alice's role ===")
-updated_alice = Node(id="alice", type="Person", properties={"name": "Alice", "role": "Senior Engineer"})
-store.add_graph_documents([GraphDocument(nodes=[updated_alice], relationships=[], source=source)])
-
-results = store.query("MATCH (n {node_id: 'alice'}) RETURN n.name, n.role")
-for row in results:
-    print(f"  {row}")
-
-store.close()
+print("\n=== Your own facts: who leads Hooli? ===")
+for row in episodes.query(
+    "MATCH (p:Person)-[l:LEADS]->(c:Company {node_id: 'Hooli'}) RETURN p.node_id AS person, l.role AS role"
+):
+    print(f"  {row['person']} ({row['role']})")
+nodes = episodes.query("MATCH (n) RETURN count(n) AS n")[0]["n"]
+print(f"  {nodes} nodes after adding the episode twice: 3 entities and 1 source document")

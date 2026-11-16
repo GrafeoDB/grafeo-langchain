@@ -308,7 +308,7 @@ wheels = [
 
 [[package]]
 name = "grafeo"
-version = "0.6.2"
+version = "0.6.3"
 source = { editable = "../grafeo/crates/bindings/python" }
 dependencies = [
     { name = "solvor", version = "0.6.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
@@ -328,6 +328,15 @@ requires-dist = [
 provides-extras = ["arrow", "cli", "dev"]
 
 [[package]]
+name = "grafeo-datasets"
+version = "0.6.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/05/a3/1824000ef9d9f55acc580d6aaee92acffdff341326dbb2f7716f4cc5cedd/grafeo_datasets-0.6.3.tar.gz", hash = "sha256:b58d0950905755181a9e496e973137c247980ffe361dcb91e171d47cff2b69de", size = 258446, upload-time = "2026-11-15T19:30:57.155Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9f/e7/8e127cd346dbcdc15aa26ed2897147e15e82de9076dd1a37c144b84f2bbe/grafeo_datasets-0.6.3-py3-none-any.whl", hash = "sha256:a6ad4c07b0180bd9ec0925b5e3828dd5e38c869f7cb50056f7d5f6bb11482413", size = 268568, upload-time = "2026-11-15T19:30:55.686Z" },
+]
+
+[[package]]
 name = "grafeo-langchain"
 version = "0.3.0"
 source = { editable = "." }
@@ -343,6 +352,7 @@ retriever = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "grafeo-datasets" },
     { name = "langchain" },
     { name = "langchain-graph-retriever" },
     { name = "pytest" },
@@ -361,6 +371,7 @@ provides-extras = ["retriever"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "grafeo-datasets", specifier = ">=0.6.3" },
     { name = "langchain", specifier = ">=1.2" },
     { name = "langchain-graph-retriever", specifier = ">=0.8" },
     { name = "pytest", specifier = ">=9" },

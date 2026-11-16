@@ -1,90 +1,110 @@
-"""Graph Retriever adapter demo with Eager strategy.
+"""GrafeoAdapter with langchain-graph-retriever on the Silicon Valley dataset.
 
-Demonstrates using GrafeoAdapter with langchain-graph-retriever
-for advanced graph traversal strategies via metadata edges.
+Demonstrates:
+- The dataset's people as documents, with their company and city as metadata
+- GraphRetriever with the Eager strategy, following metadata edges: colleagues share a company
+- A metadata filter on the retriever
+
+Uses Mistral embeddings when MISTRAL_API_KEY is set, and an offline keyword stand-in otherwise.
 
 Requires:
-    uv add grafeo-langchain[retriever]
+    uv add "grafeo-langchain[retriever]"
 
 Run:
-    uv run python examples/graph_retriever_demo.py
+    uv run python examples/graph_retriever_demo.py                                # no API key
+    uv run --with langchain-mistralai python examples/graph_retriever_demo.py    # with MISTRAL_API_KEY
 """
 
 from __future__ import annotations
 
 import hashlib
+import importlib
+import os
+import re
 
+from grafeo_datasets import silicon_valley
+from graph_retriever.strategies import Eager
 from langchain_core.embeddings import Embeddings
+from langchain_graph_retriever import GraphRetriever
 
 from grafeo_langchain import GrafeoGraphVectorStore
 from grafeo_langchain.adapter import GrafeoAdapter
 
-DIMS = 32
 
+class KeywordEmbeddings(Embeddings):
+    """Offline stand-in for an embedding model: texts that share words come out close."""
 
-class DemoEmbeddings(Embeddings):
-    """Deterministic hash-based embeddings for demo purposes."""
+    def __init__(self, dims: int = 512) -> None:
+        self.dims = dims
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return [self._embed(t) for t in texts]
+        return [self.embed_query(text) for text in texts]
 
     def embed_query(self, text: str) -> list[float]:
-        return self._embed(text)
+        vector = [0.0] * self.dims
+        for word in re.findall(r"[a-z]{3,}", text.lower()):
+            vector[int(hashlib.md5(word.encode()).hexdigest(), 16) % self.dims] += 1.0
+        return vector if any(vector) else [1.0] + [0.0] * (self.dims - 1)
 
-    def _embed(self, text: str) -> list[float]:
-        digest = hashlib.sha256(text.encode()).digest()
-        return [b / 255.0 for b in digest[:DIMS]]
+
+def pick_embeddings() -> Embeddings:
+    if os.environ.get("MISTRAL_API_KEY"):
+        # optional (uv run --with langchain-mistralai): imported by name, so type checkers do not require it
+        MistralAIEmbeddings = importlib.import_module("langchain_mistralai").MistralAIEmbeddings
+        print("Embeddings: Mistral (mistral-embed)")
+        return MistralAIEmbeddings(model="mistral-embed")
+    print("Embeddings: offline keyword stand-in (set MISTRAL_API_KEY to use Mistral)")
+    return KeywordEmbeddings()
 
 
-# ── Create store and add documents ───────────────────────────────────────────
+def show(title: str, docs: list) -> None:
+    print(f"\n=== {title} ===")
+    for doc in docs:
+        place = f"{doc.metadata.get('company', '-')}, {doc.metadata.get('city', '-')}"
+        print(f"  [{doc.id}] {place}: {doc.page_content[:60]}...")
 
-embeddings = DemoEmbeddings()
-store = GrafeoGraphVectorStore(embedding=embeddings)
 
+# ── People, with their company and city ───────────────────────────────────────
+
+names = {node["key"]: node["name"] for node in silicon_valley.nodes()}
+company: dict[str, str] = {}
+city: dict[str, str] = {}
+for edge in silicon_valley.edges():
+    if edge["type"] == "WORKS_AT":
+        company.setdefault(edge["source"], names[edge["target"]])
+    elif edge["type"] == "LIVES_IN":
+        city.setdefault(edge["source"], names[edge["target"]])
+
+people = [node for node in silicon_valley.nodes() if node["label"] == "Person"]
+store = GrafeoGraphVectorStore(embedding=pick_embeddings())
 store.add_texts(
-    texts=[
-        "Python is a high-level programming language.",
-        "Guido van Rossum created Python.",
-        "ABC influenced Python's design.",
-        "Rust is a systems programming language.",
-        "TypeScript is a typed superset of JavaScript.",
-    ],
+    texts=[person["description"] for person in people],
     metadatas=[
-        {"topic": "python"},
-        {"topic": "python"},
-        {"topic": "python"},
-        {"topic": "rust"},
-        {"topic": "typescript"},
+        {
+            "name": person["name"],
+            **({"company": company[person["key"]]} if person["key"] in company else {}),
+            **({"city": city[person["key"]]} if person["key"] in city else {}),
+        }
+        for person in people
     ],
-    ids=["python", "guido", "abc", "rust", "typescript"],
+    ids=[person["key"] for person in people],
 )
 
-# ── Create adapter and retriever ─────────────────────────────────────────────
-
-from graph_retriever.strategies import Eager  # noqa: E402
-from langchain_graph_retriever import GraphRetriever  # noqa: E402
-
-adapter = GrafeoAdapter(vector_store=store)
+# ── The retriever: the best match, then the people who share its company ───
 
 retriever = GraphRetriever(
-    store=adapter,
-    edges=[("topic", "topic")],
-    strategy=Eager(select_k=5, start_k=2),
+    store=GrafeoAdapter(vector_store=store),
+    edges=[("company", "company")],
+    strategy=Eager(select_k=4, start_k=1, max_depth=1),
 )
 
-# ── Invoke the retriever ─────────────────────────────────────────────────────
-
-print("=== Eager Strategy (topic edges) ===")
-docs = retriever.invoke("programming languages")
-for doc in docs:
-    print(f"  [{doc.metadata.get('id', '?')}] {doc.page_content[:80]}")
-print()
-
-# ── With metadata filter ─────────────────────────────────────────────────────
-
-print("=== Filtered (topic=python) ===")
-docs = retriever.invoke("programming", filter={"topic": "python"})
-for doc in docs:
-    print(f"  [{doc.metadata.get('id', '?')}] {doc.page_content[:80]}")
+show(
+    "The systems architect who trusts his server, then his colleagues",
+    retriever.invoke("the systems architect who trusts his own server"),
+)
+show(
+    "The incubator owner, only among people who live in Palo Alto",
+    retriever.invoke("the owner of the incubator in his own house", filter={"city": "Palo Alto"}),
+)
 
 store.close()

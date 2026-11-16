@@ -46,6 +46,17 @@ IDS = ["alpha", "beta", "gamma"]
 
 
 class TestAdapterSearch:
+    def test_score_matches_store(
+        self, adapter: GrafeoAdapter, store: GrafeoGraphVectorStore, embedding: FakeEmbeddings
+    ) -> None:
+        store.add_texts(TEXTS, metadatas=METAS, ids=IDS)
+        vec = embedding.embed_query(TEXTS[0])
+        adapter_scores = {d.id: d.metadata["score"] for d in adapter._search(vec, k=3)}
+        store_scores = {d.id: d.metadata["score"] for d in store.similarity_search_by_vector(vec, k=3)}
+        assert adapter_scores == pytest.approx(store_scores)
+        assert adapter_scores["alpha"] == pytest.approx(1.0, abs=1e-5)
+        assert all(0.0 <= score <= 1.0 for score in adapter_scores.values())
+
     def test_search_returns_documents_with_embedding(
         self, adapter: GrafeoAdapter, store: GrafeoGraphVectorStore, embedding: FakeEmbeddings
     ) -> None:
