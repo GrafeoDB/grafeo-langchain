@@ -521,16 +521,15 @@ properties.
 
 Grafeo runs inside the Python process, so a graph store for LangChain is one `uv add` away:
 
-| | Server-based graph database (such as Neo4j) | Grafeo |
-| --- | --- | --- |
-| Setup | Install and run a server (Docker, a desktop app or a cloud service), then connect with a URL and credentials | `uv add grafeo-langchain` |
-| Vector search | A vector index to configure next to the graph | Built in (HNSW), created by the store |
-| Graph algorithms | A plugin to install and enable | Built in (PageRank, Louvain, ...) |
-| Query languages | Cypher | GQL, Cypher and Gremlin |
-| Data on disk | The server's data directory | One `.grafeo` file |
-| Tests and notebooks | A running server for every test run | In-memory store, nothing to start or clean up |
+- **Setup**: `uv add grafeo-langchain`. No server, Docker, URL or credentials.
+- **Vector search**: built in (HNSW); the store creates the index.
+- **Graph algorithms**: built in (PageRank, Louvain, ...), with no plugin to install.
+- **Query languages**: GQL, Cypher and Gremlin.
+- **Data on disk**: one `.grafeo` file, or memory only.
+- **Tests and notebooks**: an in-memory store, with nothing to start or clean up.
 
-A server-based database is the better fit when several processes or machines share one graph.
+The database lives in one process: when several processes or machines share one graph, run them through
+a single service in front of it.
 
 ## API Reference
 
