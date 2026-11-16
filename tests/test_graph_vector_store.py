@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import warnings
 from decimal import Decimal
-from typing import cast
+from typing import ClassVar, cast
 
 import grafeo
 import pytest
@@ -115,7 +116,7 @@ class TestTraversalSearch:
     def test_finds_linked_documents(self, store: GrafeoGraphVectorStore) -> None:
         """Traversal follows outgoing edges from seed nodes."""
         store.add_texts(["neighbor document"], ids=["neighbor"])
-        # seed links OUT to neighbor — traversal from seed follows outgoing edges
+        # seed links OUT to neighbor: traversal from seed follows outgoing edges
         store.add_texts(
             ["seed document"],
             metadatas=[{"__graph_links__": [{"target_id": "neighbor", "type": "RELATES_TO"}]}],
@@ -150,7 +151,7 @@ class TestMmrTraversalSearch:
 
     def test_finds_linked_documents(self, store: GrafeoGraphVectorStore) -> None:
         store.add_texts(["mmr neighbor"], ids=["mmr_nb"])
-        # seed links OUT to neighbor — traversal from seed follows outgoing edges
+        # seed links OUT to neighbor: traversal from seed follows outgoing edges
         store.add_texts(
             ["seed for mmr"],
             metadatas=[{"__graph_links__": [{"target_id": "mmr_nb", "type": "RELATES_TO"}]}],
@@ -861,3 +862,201 @@ class TestTraversalResultOrder:
             assert scores[: len(scored)] == scored, f"a document without a score came before a scored one: {scores}"
             assert scored == sorted(scored, reverse=True)
             assert all(d.metadata["source"] == "graph_traversal" for d in docs[len(scored) :])
+
+
+# ── LangChain VectorStore methods ───────────────────────────────────────────
+
+
+class TestSimilaritySearchWithScore:
+    def test_returns_cosine_distance(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(TEXTS, ids=["a", "b", "c", "d"])
+        hits = store.similarity_search_with_score(TEXTS[0], k=2)
+        assert len(hits) == 2
+        doc, distance = hits[0]
+        assert doc.id == "a"
+        assert distance == pytest.approx(0.0, abs=1e-5), "an exact match has cosine distance 0"
+        assert hits[0][1] <= hits[1][1], "closest first"
+
+    def test_distance_matches_metadata_score(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(TEXTS)
+        for doc, distance in store.similarity_search_with_score("Acme", k=4):
+            assert doc.metadata["score"] == pytest.approx(1.0 - distance / 2)
+
+    def test_filter(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(TEXTS, metadatas=[{"tag": "x"}, {"tag": "y"}, {"tag": "x"}, {"tag": "y"}])
+        hits = store.similarity_search_with_score("Acme", k=4, filter={"tag": "y"})
+        assert {doc.metadata["tag"] for doc, _ in hits} == {"y"}
+
+    def test_relevance_scores(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(TEXTS, ids=["a", "b", "c", "d"])
+        hits = store.similarity_search_with_relevance_scores(TEXTS[0], k=4)
+        assert hits[0][0].id == "a"
+        assert hits[0][1] == pytest.approx(1.0, abs=1e-5)
+        assert [score for _, score in hits] == sorted((score for _, score in hits), reverse=True)
+
+    def test_score_threshold_retriever(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(TEXTS, ids=["a", "b", "c", "d"])
+        retriever = store.as_retriever(
+            search_type="similarity_score_threshold", search_kwargs={"score_threshold": 0.9999}
+        )
+        assert [d.id for d in retriever.invoke(TEXTS[0])] == ["a"]
+
+    def test_wrong_dimensions(self, store: GrafeoGraphVectorStore) -> None:
+        with pytest.raises(ValueError, match="dimensional"):
+            store.similarity_search_with_score_by_vector([1.0] * (DIMS + 1))
+
+
+class DirectionEmbeddings(FakeEmbeddings):
+    """Unit vectors in fixed directions, so cosine distances span the whole range 0 to 2."""
+
+    VECTORS: ClassVar[dict[str, list[float]]] = {
+        "same": [1.0, 0.0, 0.0, 0.0],
+        "unrelated": [0.0, 1.0, 0.0, 0.0],
+        "opposite": [-1.0, 0.0, 0.0, 0.0],
+    }
+
+    def _embed(self, text: str) -> list[float]:
+        return self.VECTORS.get(text, [0.5, 0.5, 0.5, 0.5])
+
+
+class TestScoreRange:
+    """Scores run from 0 to 1 (1 - cosine distance / 2), as LangChain expects of relevance scores."""
+
+    @pytest.fixture
+    def directions(self) -> GrafeoGraphVectorStore:
+        store = GrafeoGraphVectorStore(DirectionEmbeddings())
+        store.add_texts(["same", "unrelated", "opposite"], ids=["same", "unrelated", "opposite"])
+        return store
+
+    def test_metadata_scores(self, directions: GrafeoGraphVectorStore) -> None:
+        scores = {d.id: d.metadata["score"] for d in directions.similarity_search("same", k=3)}
+        assert scores == pytest.approx({"same": 1.0, "unrelated": 0.5, "opposite": 0.0}, abs=1e-5)
+
+    def test_relevance_scores(self, directions: GrafeoGraphVectorStore) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # LangChain warns about scores outside 0 to 1
+            hits = directions.similarity_search_with_relevance_scores("same", k=3)
+        assert {d.id: score for d, score in hits} == pytest.approx(
+            {"same": 1.0, "unrelated": 0.5, "opposite": 0.0}, abs=1e-5
+        )
+
+    def test_distances(self, directions: GrafeoGraphVectorStore) -> None:
+        hits = directions.similarity_search_with_score("same", k=3)
+        assert {d.id: distance for d, distance in hits} == pytest.approx(
+            {"same": 0.0, "unrelated": 1.0, "opposite": 2.0}, abs=1e-5
+        )
+
+    def test_threshold_retriever(self, directions: GrafeoGraphVectorStore) -> None:
+        retriever = directions.as_retriever(
+            search_type="similarity_score_threshold", search_kwargs={"k": 3, "score_threshold": 0.4}
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert [d.id for d in retriever.invoke("same")] == ["same", "unrelated"]
+
+    @pytest.mark.skipif(not HAS_MMR, reason="grafeo build lacks mmr_search")
+    def test_mmr_traversal_scores(self, directions: GrafeoGraphVectorStore) -> None:
+        docs = directions.mmr_traversal_search("same", k=3, depth=0, lambda_mult=1.0)
+        assert all(0.0 <= d.metadata["score"] <= 1.0 for d in docs)
+
+
+@pytest.mark.skipif(not HAS_MMR, reason="grafeo build lacks mmr_search")
+class TestMaxMarginalRelevanceSearch:
+    def test_returns_k_documents(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(TEXTS, ids=["a", "b", "c", "d"])
+        docs = store.max_marginal_relevance_search(TEXTS[0], k=2, fetch_k=4)
+        assert len(docs) == 2
+        assert docs[0].id == "a", "the most relevant document is picked first"
+        assert len({d.id for d in docs}) == 2
+
+    def test_filter(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(TEXTS, metadatas=[{"tag": "x"}, {"tag": "y"}, {"tag": "x"}, {"tag": "y"}])
+        docs = store.max_marginal_relevance_search("Acme", k=4, filter={"tag": "x"})
+        assert {d.metadata["tag"] for d in docs} == {"x"}
+
+    def test_mmr_retriever(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(TEXTS, ids=["a", "b", "c", "d"])
+        docs = store.as_retriever(search_type="mmr", search_kwargs={"k": 2, "fetch_k": 4}).invoke(TEXTS[0])
+        assert [d.id for d in docs][:1] == ["a"]
+        assert len(docs) == 2
+
+    def test_empty_store(self, store: GrafeoGraphVectorStore) -> None:
+        assert store.max_marginal_relevance_search("anything") == []
+
+
+class TestGetByIds:
+    def test_in_given_order(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(TEXTS[:3], metadatas=[{"n": 1}, {"n": 2}, {"n": 3}], ids=["a", "b", "c"])
+        docs = store.get_by_ids(["c", "a"])
+        assert [(d.id, d.page_content, d.metadata) for d in docs] == [
+            ("c", TEXTS[2], {"id": "c", "n": 3}),
+            ("a", TEXTS[0], {"id": "a", "n": 1}),
+        ]
+
+    def test_unknown_ids_skipped(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(["hello"], ids=["a"])
+        assert [d.id for d in store.get_by_ids(["missing", "a"])] == ["a"]
+        assert store.get_by_ids([]) == []
+
+    def test_after_delete(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(["one", "two"], ids=["a", "b"])
+        store.delete(["a"])
+        assert [d.id for d in store.get_by_ids(["a", "b"])] == ["b"]
+
+
+# ── Retrieval depth ────────────────────────────────────────────────────────
+
+
+class TestDepthMetadata:
+    """``_depth`` tells search hits (0) from linked documents (hops), whatever the stored metadata holds."""
+
+    def _chain(self, store: GrafeoGraphVectorStore) -> None:
+        # documents from a LangChain loader carry their own "source"
+        store.add_texts(
+            ["seed", "one hop", "two hops"],
+            metadatas=[
+                {"source": "a.txt", "__graph_links__": [{"target_id": "one"}]},
+                {"source": "b.txt", "__graph_links__": [{"target_id": "two"}]},
+                {"source": "c.txt"},
+            ],
+            ids=["seed", "one", "two"],
+        )
+
+    def test_search_hits_have_depth_zero(self, store: GrafeoGraphVectorStore) -> None:
+        self._chain(store)
+        assert all(d.metadata["_depth"] == 0 for d in store.similarity_search("seed", k=3))
+
+    def test_traversal_depth_counts_hops(self, store: GrafeoGraphVectorStore) -> None:
+        self._chain(store)
+        docs = store.traversal_search("seed", k=1, depth=2)
+        assert [(d.id, d.metadata["_depth"]) for d in docs] == [("seed", 0), ("one", 1)]
+        assert [d.metadata["source"] for d in docs] == ["a.txt", "b.txt"], "a stored source wins"
+
+    def test_depth_counts_hops_past_filtered_documents(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(
+            ["seed", "one hop", "two hops"],
+            metadatas=[
+                {"tag": "x", "__graph_links__": [{"target_id": "one"}]},
+                {"tag": "y", "__graph_links__": [{"target_id": "two"}]},
+                {"tag": "x"},
+            ],
+            ids=["seed", "one", "two"],
+        )
+        docs = store.traversal_search("seed", k=1, depth=2, filter={"tag": "x"})
+        assert [(d.id, d.metadata["_depth"]) for d in docs] == [("seed", 0), ("two", 2)]
+
+    @pytest.mark.skipif(not HAS_MMR, reason="grafeo build lacks mmr_search")
+    def test_mmr_traversal_depth(self, store: GrafeoGraphVectorStore) -> None:
+        self._chain(store)
+        docs = store.mmr_traversal_search("seed", k=1, depth=1)
+        assert [(d.id, d.metadata["_depth"]) for d in docs] == [("seed", 0), ("one", 1)]
+
+    def test_marker_kept_without_stored_source(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(["seed", "linked"], metadatas=[{"__graph_links__": [{"target_id": "l"}]}, {}], ids=["s", "l"])
+        docs = store.traversal_search("seed", k=1, depth=1)
+        assert [d.metadata["source"] for d in docs] == ["vector", "graph_traversal"]
+
+    def test_depth_is_reserved(self, store: GrafeoGraphVectorStore) -> None:
+        store.add_texts(["hello"], metadatas=[{"_depth": 7}], ids=["a"])
+        assert store.similarity_search("hello", k=1)[0].metadata["_depth"] == 0
+        assert "_depth" not in store.get_by_ids(["a"])[0].metadata

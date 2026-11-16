@@ -4,6 +4,7 @@ import hashlib
 from decimal import Decimal
 from pathlib import Path
 
+import grafeo
 import pytest
 from langchain_core.documents import Document
 
@@ -47,10 +48,17 @@ class TestSchema:
     def test_schema_string_after_ingestion(self, store: GrafeoGraphStore) -> None:
         store.add_graph_documents([SAMPLE_GRAPH_DOC])
         store.refresh_schema()
-        text = store.get_schema
-        assert "Node labels:" in text
-        assert "Person" in text
-        assert "Relationship types:" in text
+        assert store.get_schema == (
+            "Node labels and properties:\n"
+            "Company {name: STRING, node_id: STRING}\n"
+            "Person {age: INT64, name: STRING, node_id: STRING}\n"
+            "Relationship types and properties:\n"
+            "KNOWS\n"
+            "WORKS_AT\n"
+            "Relationships:\n"
+            "(:Person)-[:KNOWS]->(:Person)\n"
+            "(:Person)-[:WORKS_AT]->(:Company)"
+        )
 
     def test_schema_invalidated_after_add(self, store: GrafeoGraphStore) -> None:
         """add_graph_documents should clear the cached schema."""
@@ -138,7 +146,7 @@ class TestQuery:
         assert results == []
 
     def test_relationship_with_new_nodes(self, store: GrafeoGraphStore) -> None:
-        """Relationships can reference nodes not in the nodes list — they get created."""
+        """Relationships can reference nodes not in the nodes list: they get created."""
         eve = Node(id="eve", type="Person")
         rel = Relationship(source=eve, target=ALICE, type="FOLLOWS")
         doc = GraphDocument(nodes=[ALICE], relationships=[rel], source=SOURCE_DOC)
@@ -390,3 +398,153 @@ class TestGraphStorePersistence:
             assert _count(store, "(:SourceDocument)") == 1
             assert _count(store, "()-[:WORKS_AT]->()") == 2
             assert _count(store, "()-[:MENTIONED_IN]->()") == 3
+
+
+# ── Schema for LLM prompts ──────────────────────────────────────────────────
+
+
+class TestSchemaDetail:
+    """The schema text and the langchain-neo4j-shaped keys that QA chains read."""
+
+    def test_structured_schema_neo4j_keys(self, store: GrafeoGraphStore) -> None:
+        store.add_graph_documents([SAMPLE_GRAPH_DOC])
+        schema = store.get_structured_schema
+        assert schema["node_props"]["Person"] == [
+            {"property": "age", "type": "INT64"},
+            {"property": "name", "type": "STRING"},
+            {"property": "node_id", "type": "STRING"},
+        ]
+        assert schema["rel_props"] == {"KNOWS": [], "WORKS_AT": []}
+        assert schema["relationships"] == [
+            {"start": "Person", "type": "KNOWS", "end": "Person"},
+            {"start": "Person", "type": "WORKS_AT", "end": "Company"},
+        ]
+
+    def test_relationship_properties(self, store: GrafeoGraphStore) -> None:
+        rel = Relationship(source=ALICE, target=BOB, type="KNOWS", properties={"since": 2020, "weight": 0.5})
+        store.add_graph_documents([GraphDocument(nodes=[ALICE, BOB], relationships=[rel], source=SOURCE_DOC)])
+        assert "KNOWS {since: INT64, weight: FLOAT64}" in store.get_schema.splitlines()
+
+    def test_property_with_several_types(self, store: GrafeoGraphStore) -> None:
+        nodes = [Node(id="a", type="Item", properties={"size": 1}), Node(id="b", type="Item", properties={"size": "L"})]
+        store.add_graph_documents([GraphDocument(nodes=nodes, relationships=[], source=SOURCE_DOC)])
+        assert "Item {node_id: STRING, size: INT64 | STRING}" in store.get_schema.splitlines()
+
+    def test_value_types(self, store: GrafeoGraphStore) -> None:
+        props = {"flag": True, "price": Decimal("1.50"), "ratio": 0.5}
+        store.add_graph_documents(
+            [GraphDocument(nodes=[Node(id="x", type="Thing", properties=props)], relationships=[], source=SOURCE_DOC)]
+        )
+        assert "Thing {flag: BOOL, node_id: STRING, price: DECIMAL, ratio: FLOAT64}" in store.get_schema.splitlines()
+
+    def test_labels_without_relationships(self, store: GrafeoGraphStore) -> None:
+        store.add_graph_documents([GraphDocument(nodes=[ALICE], relationships=[], source=SOURCE_DOC)])
+        assert store.get_schema == "Node labels and properties:\nPerson {age: INT64, name: STRING, node_id: STRING}"
+
+    def test_source_documents_listed(self, store: GrafeoGraphStore) -> None:
+        store.add_graph_documents([SAMPLE_GRAPH_DOC], include_source=True)
+        lines = store.get_schema.splitlines()
+        assert "SourceDocument {id: STRING, node_id: STRING, text: STRING}" in lines
+        assert "()-[:MENTIONED_IN]->(:SourceDocument)" in lines, "one line for the store's own edges"
+        assert not any("(:Company)-[:MENTIONED_IN]" in line or "(:Person)-[:MENTIONED_IN]" in line for line in lines)
+        assert lines[-1] == "()-[:MENTIONED_IN]->(:SourceDocument)", "after the graph's own relationships"
+
+    def test_patterns_merge_labels(self, store: GrafeoGraphStore) -> None:
+        acme = Node(id="Acme", type="Organization")
+        globex = Node(id="Globex", type="Company")
+        lyon, berlin = Node(id="Lyon", type="City"), Node(id="Berlin", type="City")
+        rels = [
+            Relationship(source=acme, target=lyon, type="LOCATED_IN"),
+            Relationship(source=globex, target=berlin, type="LOCATED_IN"),
+            Relationship(source=ALICE, target=acme, type="WORKS_AT"),
+            Relationship(source=BOB, target=globex, type="WORKS_AT"),
+        ]
+        store.add_graph_documents(
+            [GraphDocument(nodes=[acme, globex, lyon, berlin, ALICE, BOB], relationships=rels, source=SOURCE_DOC)]
+        )
+        lines = store.get_schema.splitlines()
+        relationships = lines[lines.index("Relationships:") + 1 :]
+        assert relationships == [
+            "(:Company|Organization)-[:LOCATED_IN]->(:City)",
+            "(:Person)-[:WORKS_AT]->(:Company|Organization)",
+        ]
+        assert store.query("MATCH (c:Company|Organization)-[:LOCATED_IN]->(:City) RETURN count(c) AS n") == [
+            {"n": 2}
+        ], "the merged pattern is valid GQL, as an LLM may copy it"
+
+    def test_structured_schema_keeps_every_pattern(self, store: GrafeoGraphStore) -> None:
+        store.add_graph_documents([SAMPLE_GRAPH_DOC], include_source=True)
+        mentioned = [r for r in store.get_structured_schema["relationships"] if r["type"] == "MENTIONED_IN"]
+        assert {r["start"] for r in mentioned} == {"Company", "Person"}
+
+    def test_deleted_label_leaves_schema(self, store: GrafeoGraphStore) -> None:
+        store.add_graph_documents([SAMPLE_GRAPH_DOC])
+        store.query("MATCH (c:Company) DETACH DELETE c")
+        schema = store.get_structured_schema
+        assert "Company" not in schema["labels"]
+        assert "Company" not in schema["node_props"]
+        assert all(rel["type"] != "WORKS_AT" for rel in schema["relationships"])
+
+
+# ── Read-only queries ────────────────────────────────────────────────────────
+
+
+class TestReadOnlyQuery:
+    def test_read_returns_rows(self, store: GrafeoGraphStore) -> None:
+        store.add_graph_documents([SAMPLE_GRAPH_DOC])
+        rows = store.query("MATCH (p:Person) RETURN p.node_id AS id ORDER BY id", read_only=True)
+        assert rows == [{"id": "alice"}, {"id": "bob"}]
+
+    def test_params(self, store: GrafeoGraphStore) -> None:
+        store.add_graph_documents([SAMPLE_GRAPH_DOC])
+        rows = store.query("MATCH (p:Person {node_id: $id}) RETURN p.age AS age", {"id": "bob"}, read_only=True)
+        assert rows == [{"age": 25}]
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "INSERT (:Person {node_id: 'eve'})",
+            "CREATE (:Person {node_id: 'eve'})",
+            "MERGE (:Person {node_id: 'eve'})",
+            "MATCH (p:Person {node_id: 'bob'}) SET p.age = 99",
+            "MATCH (p:Person {node_id: 'bob'}) REMOVE p.age",
+            "MATCH (p:Person {node_id: 'bob'}) DETACH DELETE p",
+            "MATCH (:Person)-[r:KNOWS]->(:Person) DELETE r",
+            "MATCH (p:Person {node_id: 'bob'}) SET p:Manager",
+        ],
+    )
+    def test_write_refused_and_rolled_back(self, store: GrafeoGraphStore, query: str) -> None:
+        store.add_graph_documents([SAMPLE_GRAPH_DOC])
+        before = store.query("MATCH (n) OPTIONAL MATCH (n)-[r]->() RETURN n, collect(r) AS rels ORDER BY n.node_id")
+        with pytest.raises(ValueError, match="read-only query may not write"):
+            store.query(query, read_only=True)
+        after = store.query("MATCH (n) OPTIONAL MATCH (n)-[r]->() RETURN n, collect(r) AS rels ORDER BY n.node_id")
+        assert after == before, "the graph is unchanged"
+
+    def test_refused_write_keeps_schema_cache(self, store: GrafeoGraphStore) -> None:
+        store.add_graph_documents([SAMPLE_GRAPH_DOC])
+        cached = store.get_structured_schema
+        with pytest.raises(ValueError):
+            store.query("INSERT (:Robot {node_id: 'r'})", read_only=True)
+        assert store.get_structured_schema is cached
+        assert "Robot" not in store.get_structured_schema["labels"]
+
+    def test_syntax_error_raises_grafeo_error(self, store: GrafeoGraphStore) -> None:
+        with pytest.raises(grafeo.GrafeoError):
+            store.query("MATCH (n RETURN n", read_only=True)
+        assert store.query("MATCH (n) RETURN count(n) AS c", read_only=True) == [{"c": 0}], "the store still works"
+
+    def test_store_usable_after_refusal(self, store: GrafeoGraphStore) -> None:
+        with pytest.raises(ValueError):
+            store.query("INSERT (:Robot {node_id: 'r'})", read_only=True)
+        store.query("INSERT (:Robot {node_id: 'r'})")
+        assert store.query("MATCH (r:Robot) RETURN r.node_id AS id", read_only=True) == [{"id": "r"}]
+
+    def test_persistent_store_unchanged_after_reopen(self, tmp_path: Path) -> None:
+        path = str(tmp_path / "ro.grafeo")
+        with GrafeoGraphStore(db_path=path) as store:
+            store.add_graph_documents([SAMPLE_GRAPH_DOC])
+            with pytest.raises(ValueError):
+                store.query("MATCH (n) DETACH DELETE n", read_only=True)
+        with GrafeoGraphStore(db_path=path) as store:
+            assert store.query("MATCH (n) RETURN count(n) AS c") == [{"c": 3}]
